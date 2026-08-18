@@ -1,0 +1,27 @@
+[project]
+name = "ai-chat-server"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "sunwei", email = "sw17826157718@126.com@.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "bcrypt>=5.0.0",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "pydantic-settings>=2.15.0",
+    "pyjwt>=2.13.0",
+    "uvicorn[standard]>=0.52.3",
+]
+
+[project.scripts]
+ai-chat-server = "ai_chat_server:main"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
