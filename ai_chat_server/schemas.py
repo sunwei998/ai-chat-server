@@ -54,6 +54,16 @@ class UserUpdate(BaseModel):
     gender: str | None = Field(default=None, pattern="^(male|female|other)$")
 
 
+class ProfileUpdate(BaseModel):
+    username: str | None = Field(default=None, min_length=3, max_length=32)
+    avatar: str | None = Field(default=None, max_length=400000)
+    age: int | None = Field(default=None, ge=1, le=120)
+    gender: str | None = Field(default=None, pattern="^(male|female|other)?$")
+    province: str | None = Field(default=None, max_length=32)
+    city: str | None = Field(default=None, max_length=32)
+    district: str | None = Field(default=None, max_length=32)
+
+
 class ResetPasswordRequest(BaseModel):
     password: str = Field(min_length=6, max_length=128)
 

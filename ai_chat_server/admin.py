@@ -16,6 +16,13 @@ router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(re
 
 _DAY_MS = 24 * 3600 * 1000
 
+_PERIODS: dict[str, int] = {
+    "day": 1 * _DAY_MS,
+    "week": 7 * _DAY_MS,
+    "month": 30 * _DAY_MS,
+    "year": 365 * _DAY_MS,
+}
+
 
 @router.get("/stats")
 def stats():
@@ -53,6 +60,7 @@ def list_users():
         """
         SELECT u.id, u.username, u.role, u.is_active, u.created_at, u.last_seen_at,
                u.province, u.city, u.district, u.age, u.gender,
+               u.updated_at, u.updated_by,
                COALESCE((SELECT COUNT(*) FROM login_logs l WHERE l.user_id = u.id AND l.success = 1), 0) AS logins,
                COALESCE((SELECT SUM(t.total_tokens) FROM token_usage t WHERE t.user_id = u.id), 0) AS total_tokens
         FROM users u ORDER BY u.created_at DESC
@@ -62,7 +70,7 @@ def list_users():
 
 
 @router.patch("/users/{user_id}")
-def update_user(user_id: int, body: UserUpdate):
+def update_user(user_id: int, body: UserUpdate, admin: dict = Depends(require_admin)):
     row = fetch_one("SELECT * FROM users WHERE id = ?", (user_id,))
     if not row:
         raise HTTPException(status_code=404, detail="用户不存在")
@@ -90,17 +98,24 @@ def update_user(user_id: int, body: UserUpdate):
         params.append(body.gender)
     if not sets:
         return {"ok": True}
+    sets.append("updated_at = ?")
+    params.append(now_ms())
+    sets.append("updated_by = ?")
+    params.append(admin["username"])
     params.append(user_id)
     execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", params)
     return {"ok": True}
 
 
 @router.post("/users/{user_id}/reset-password")
-def reset_password(user_id: int, body: ResetPasswordRequest):
+def reset_password(user_id: int, body: ResetPasswordRequest, admin: dict = Depends(require_admin)):
     row = fetch_one("SELECT id FROM users WHERE id = ?", (user_id,))
     if not row:
         raise HTTPException(status_code=404, detail="用户不存在")
-    execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(body.password), user_id))
+    execute(
+        "UPDATE users SET password_hash = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+        (hash_password(body.password), now_ms(), admin["username"], user_id),
+    )
     return {"ok": True}
 
 
@@ -181,17 +196,53 @@ def _aggregate_demographics() -> tuple[list[dict], list[dict]]:
 
 
 @router.get("/region-stats")
-def region_stats():
-    """按省/市/区聚合用户分布 + 每个地区活跃 TOP3 用户，供前端热点图使用。"""
+def region_stats(period: str = "month"):
+    """按统计周期聚合省份热度指标与省/市/区用户分布。
+
+    - provinces: 每个省份的 新增用户数 / 活跃用户数 / 对话次数 / Token 消耗量（仅统计周期内）
+    - regions:   省/市/区粒度用户分布 + 活跃 TOP3（requests/tokens 限定统计周期）
+    """
+    if period not in _PERIODS:
+        raise HTTPException(status_code=400, detail="period 仅支持 day/week/month/year")
+    start = now_ms() - _PERIODS[period]
+
+    prov_rows = fetch_all(
+        """
+        SELECT u.province,
+               COUNT(DISTINCT CASE WHEN u.created_at >= ? THEN u.id END) AS new_users,
+               COUNT(DISTINCT t.user_id) AS active_users,
+               COUNT(t.id) AS requests,
+               COALESCE(SUM(t.total_tokens), 0) AS total_tokens
+        FROM users u
+        LEFT JOIN token_usage t ON t.user_id = u.id AND t.created_at >= ?
+        WHERE u.province != ''
+        GROUP BY u.province
+        """,
+        (start, start),
+    )
+    provinces = [
+        {
+            "province": r["province"],
+            "new_users": r["new_users"],
+            "active_users": r["active_users"],
+            "requests": r["requests"],
+            "total_tokens": r["total_tokens"],
+        }
+        for r in prov_rows
+    ]
+
     rows = fetch_all(
         """
-        SELECT u.username, u.province, u.city, u.district,
-               COALESCE((SELECT COUNT(*) FROM token_usage t WHERE t.user_id = u.id), 0) AS requests,
-               COALESCE((SELECT SUM(t.total_tokens) FROM token_usage t WHERE t.user_id = u.id), 0) AS total_tokens
+        SELECT u.username, u.avatar, u.province, u.city, u.district,
+               COUNT(t.id) AS requests,
+               COALESCE(SUM(t.total_tokens), 0) AS total_tokens
         FROM users u
+        LEFT JOIN token_usage t ON t.user_id = u.id AND t.created_at >= ?
         WHERE u.province != '' OR u.city != '' OR u.district != ''
+        GROUP BY u.id
         ORDER BY u.province, u.city, u.district
-        """
+        """,
+        (start,),
     )
     regions: dict[tuple[str, str, str], dict] = {}
     for r in rows:
@@ -210,14 +261,15 @@ def region_stats():
         reg["top_users"].append(
             {
                 "username": r["username"],
+                "avatar": r["avatar"] if r["avatar"] else "",
                 "requests": r["requests"],
                 "total_tokens": r["total_tokens"],
             }
         )
     for reg in regions.values():
         reg["top_users"].sort(key=lambda u: (u["requests"], u["total_tokens"]), reverse=True)
-        reg["top_users"] = reg["top_users"][:3]
-    return list(regions.values())
+        reg["top_users"] = reg["top_users"][:10]
+    return {"period": period, "provinces": provinces, "regions": list(regions.values())}
 
 
 @router.get("/models")

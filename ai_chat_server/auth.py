@@ -11,7 +11,7 @@ from .config import settings
 from .db import execute, fetch_one, now_ms
 from .geo import resolve_ip
 from .limiter import check_ip_limit
-from .schemas import LoginRequest, RegisterRequest
+from .schemas import LoginRequest, ProfileUpdate, RegisterRequest
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -84,9 +84,9 @@ def register(body: RegisterRequest, request: Request):
     else:
         province, city, district = resolve_ip(ip)
     user_id = execute(
-        "INSERT INTO users (username, password_hash, role, province, city, district, age, gender, created_at)"
-        " VALUES (?, ?, 'user', ?, ?, ?, ?, ?, ?)",
-        (body.username, hash_password(body.password), province, city, district, body.age, body.gender, now_ms()),
+        "INSERT INTO users (username, password_hash, role, province, city, district, age, gender, updated_at, updated_by, created_at)"
+        " VALUES (?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?)",
+        (body.username, hash_password(body.password), province, city, district, body.age, body.gender, now_ms(), body.username, now_ms()),
     )
     _log_login(user_id, True, ip)
     return {
@@ -128,8 +128,21 @@ def login(body: LoginRequest, request: Request):
     }
 
 
-@router.get("/me")
-def me(user: dict = Depends(get_current_user)):
+_YEAR_MS = 365 * 24 * 3600 * 1000
+
+
+def _username_changes_left(user: dict) -> int:
+    """距当前时刻一年内，该用户名还可修改的次数（上限 3 次/年）。"""
+    count = user.get("username_change_count") or 0
+    if count < 3:
+        return 3 - count
+    last = user.get("username_changed_at")
+    if last and now_ms() - last >= _YEAR_MS:
+        return 3
+    return 0
+
+
+def _user_payload(user: dict) -> dict:
     return {
         "id": user["id"],
         "username": user["username"],
@@ -139,4 +152,53 @@ def me(user: dict = Depends(get_current_user)):
         "district": user.get("district", ""),
         "age": user.get("age"),
         "gender": user.get("gender", ""),
+        "avatar": user.get("avatar", ""),
+        "username_changes_left": _username_changes_left(user),
     }
+
+
+@router.get("/me")
+def me(user: dict = Depends(get_current_user)):
+    return _user_payload(user)
+
+
+@router.patch("/me")
+def update_me(body: ProfileUpdate, user: dict = Depends(get_current_user)):
+    fields = body.model_fields_set
+    updates: list[str] = []
+    params: list = []
+
+    if "username" in fields:
+        new_name = (body.username or "").strip()
+        if new_name != user["username"]:
+            if not (3 <= len(new_name) <= 32):
+                raise HTTPException(status_code=400, detail="用户名需 3-32 个字符")
+            if _username_changes_left(user) <= 0:
+                raise HTTPException(status_code=400, detail="用户名每年最多只能修改 3 次")
+            exists = fetch_one("SELECT id FROM users WHERE username = ?", (new_name,))
+            if exists:
+                raise HTTPException(status_code=409, detail="用户名已存在")
+            updates.append("username = ?")
+            params.append(new_name)
+            updates.append("username_change_count = ?")
+            params.append((user.get("username_change_count") or 0) + 1)
+            updates.append("username_changed_at = ?")
+            params.append(now_ms())
+
+    for col in ("avatar", "age", "gender", "province", "city", "district"):
+        if col in fields:
+            updates.append(f"{col} = ?")
+            params.append(getattr(body, col))
+
+    if updates:
+        updates.append("updated_at = ?")
+        params.append(now_ms())
+        updates.append("updated_by = ?")
+        params.append(user["username"])
+        params.append(user["id"])
+        execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
+        updated = fetch_one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        if updated:
+            return _user_payload(dict(updated))
+
+    return _user_payload(user)

@@ -23,6 +23,11 @@ CREATE TABLE IF NOT EXISTS users (
   district TEXT DEFAULT '',
   age INTEGER,
   gender TEXT DEFAULT '',
+  avatar TEXT DEFAULT '',
+  username_changed_at INTEGER,
+  username_change_count INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER,
+  updated_by TEXT DEFAULT '',
   created_at INTEGER NOT NULL
 );
 
@@ -95,6 +100,11 @@ def _migrate() -> None:
         "district TEXT DEFAULT ''",
         "age INTEGER",
         "gender TEXT DEFAULT ''",
+        "avatar TEXT DEFAULT ''",
+        "username_changed_at INTEGER",
+        "username_change_count INTEGER NOT NULL DEFAULT 0",
+        "updated_at INTEGER",
+        "updated_by TEXT DEFAULT ''",
     ):
         col = ddl.split()[0]
         if col not in cols:
