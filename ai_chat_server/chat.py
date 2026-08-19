@@ -5,6 +5,7 @@ API key 只在服务端持有，不会下发给浏览器。
 """
 
 import json
+from datetime import datetime
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -13,7 +14,8 @@ from .auth import get_current_user
 from .config import settings
 from .db import execute, fetch_one, now_ms
 from .limiter import check_user_limit
-from .schemas import ChatRequest
+from .schemas import ChatMessage, ChatRequest
+from .websearch import web_search
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -114,6 +116,38 @@ def _chat_rate_limit(user: dict = Depends(get_current_user)) -> dict:
     return user
 
 
+async def _build_search_context(body: ChatRequest) -> list:
+    """联网搜索：取最后一条用户消息作为查询词，把结果作为 system 消息注入。"""
+    last_user = next(
+        (m.content for m in reversed(body.messages) if m.role == "user" and m.content.strip()),
+        "",
+    )
+    if not last_user:
+        return body.messages
+
+    now = datetime.now()
+    weekday = "一二三四五六日"[now.weekday()]
+    current_date = f"{now.year}年{now.month}月{now.day}日（星期{weekday}）"
+
+    try:
+        results = await web_search(last_user)
+    except Exception as exc:  # noqa: BLE001 - 搜索失败不阻断聊天
+        results = f"（联网搜索失败：{exc}。请直接回答用户问题，并说明当前无法获取实时信息。）"
+
+    system_msg = ChatMessage(
+        role="system",
+        content=(
+            "当前日期："
+            f"{current_date}。\n"
+            "以下是针对用户问题进行的实时联网搜索结果。请优先依据这些信息回答，"
+            "引用来源时可给出对应链接；如果搜索结果与问题无关或信息不足，请如实说明，"
+            "但涉及年份、日期、时间等时效性问题时，应优先使用上面给出的当前日期。\n\n"
+            f"{results}"
+        ),
+    )
+    return [system_msg, *body.messages]
+
+
 @router.post("/chat")
 async def chat(
     body: ChatRequest,
@@ -127,6 +161,9 @@ async def chat(
     for m in body.messages:
         if len(m.content) > MAX_CONTENT_LEN:
             raise HTTPException(status_code=400, detail="单条消息过长")
+
+    if body.web_search:
+        body.messages = await _build_search_context(body)
 
     model = _get_model(body.model)
     payload = _build_payload(model, body)

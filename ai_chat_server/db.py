@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS users (
   province TEXT DEFAULT '',
   city TEXT DEFAULT '',
   district TEXT DEFAULT '',
+  age INTEGER,
+  gender TEXT DEFAULT '',
   created_at INTEGER NOT NULL
 );
 
@@ -58,6 +60,15 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS suggestions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title_zh TEXT NOT NULL,
+  title_en TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
 """
 
 _lock = threading.Lock()
@@ -82,10 +93,31 @@ def _migrate() -> None:
         "province TEXT DEFAULT ''",
         "city TEXT DEFAULT ''",
         "district TEXT DEFAULT ''",
+        "age INTEGER",
+        "gender TEXT DEFAULT ''",
     ):
         col = ddl.split()[0]
         if col not in cols:
             conn.execute(f"ALTER TABLE users ADD COLUMN {ddl}")
+    conn.commit()
+
+
+def _seed_suggestions(conn: sqlite3.Connection) -> None:
+    """热词表为空时写入默认推荐词（与前端 i18n 默认一致）。"""
+    n = conn.execute("SELECT COUNT(*) AS n FROM suggestions").fetchone()["n"]
+    if n:
+        return
+    defaults = [
+        ("请解释一下量子计算", "Explain quantum computing"),
+        ("如何学习编程？", "How do I learn programming?"),
+        ("写一个Python函数", "Write a Python function"),
+        ("讲一个有趣的笑话", "Tell me a funny joke"),
+    ]
+    conn.executemany(
+        "INSERT INTO suggestions (title_zh, title_en, sort_order, enabled, created_at)"
+        " VALUES (?, ?, ?, 1, ?)",
+        [(zh, en, i + 1, now_ms()) for i, (zh, en) in enumerate(defaults)],
+    )
     conn.commit()
 
 
@@ -95,6 +127,7 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         conn.commit()
         _migrate()
+        _seed_suggestions(conn)
 
 
 def fetch_all(sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:

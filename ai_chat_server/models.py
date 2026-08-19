@@ -1,4 +1,4 @@
-"""公开模型列表：GET /api/models（仅 enabled，前端 ModelSelector 数据源）。"""
+"""公开数据接口：模型列表 / 首页推荐热词。"""
 
 from fastapi import APIRouter
 
@@ -21,3 +21,13 @@ def list_public_models():
         }
         for r in rows
     ]
+
+
+@router.get("/suggestions")
+def list_public_suggestions():
+    """首页推荐热词：仅 enabled，按排序取前 6 条。"""
+    rows = fetch_all(
+        "SELECT title_zh, title_en FROM suggestions "
+        "WHERE enabled = 1 ORDER BY sort_order, id LIMIT 6"
+    )
+    return [{"title_zh": r["title_zh"], "title_en": r["title_en"]} for r in rows]

@@ -4,7 +4,7 @@ import time
 
 import bcrypt
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from jwt import InvalidTokenError
 
 from .config import settings
@@ -84,9 +84,9 @@ def register(body: RegisterRequest, request: Request):
     else:
         province, city, district = resolve_ip(ip)
     user_id = execute(
-        "INSERT INTO users (username, password_hash, role, province, city, district, created_at)"
-        " VALUES (?, ?, 'user', ?, ?, ?, ?)",
-        (body.username, hash_password(body.password), province, city, district, now_ms()),
+        "INSERT INTO users (username, password_hash, role, province, city, district, age, gender, created_at)"
+        " VALUES (?, ?, 'user', ?, ?, ?, ?, ?, ?)",
+        (body.username, hash_password(body.password), province, city, district, body.age, body.gender, now_ms()),
     )
     _log_login(user_id, True, ip)
     return {
@@ -98,8 +98,16 @@ def register(body: RegisterRequest, request: Request):
             "province": province,
             "city": city,
             "district": district,
+            "age": body.age,
+            "gender": body.gender,
         },
     }
+
+
+@router.get("/check-username")
+def check_username(username: str = Query(min_length=3, max_length=32)):
+    exists = fetch_one("SELECT id FROM users WHERE username = ?", (username,))
+    return {"available": not bool(exists)}
 
 
 @router.post("/login")
@@ -129,4 +137,6 @@ def me(user: dict = Depends(get_current_user)):
         "province": user.get("province", ""),
         "city": user.get("city", ""),
         "district": user.get("district", ""),
+        "age": user.get("age"),
+        "gender": user.get("gender", ""),
     }
