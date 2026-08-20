@@ -336,10 +336,23 @@ def list_settings():
 @router.patch("/settings/{key}")
 def update_setting(key: str, body: SettingsPayload):
     execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, body.value),
+        "INSERT OR IGNORE INTO settings (key, value, remark, enabled) VALUES (?, '', '', 1)",
+        (key,),
     )
+    updates: list[str] = []
+    params: list = []
+    if body.value is not None:
+        updates.append("value = ?")
+        params.append(body.value)
+    if body.remark is not None:
+        updates.append("remark = ?")
+        params.append(body.remark)
+    if body.enabled is not None:
+        updates.append("enabled = ?")
+        params.append(1 if body.enabled else 0)
+    if updates:
+        params.append(key)
+        execute(f"UPDATE settings SET {', '.join(updates)} WHERE key = ?", params)
     return {"ok": True}
 
 

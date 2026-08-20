@@ -5,6 +5,7 @@ API key 只在服务端持有，不会下发给浏览器。
 """
 
 import json
+import secrets
 from datetime import datetime
 
 import httpx
@@ -12,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from .auth import get_current_user
 from .config import settings
-from .db import execute, fetch_one, now_ms
+from .db import execute, fetch_one, now_ms, transaction
 from .limiter import check_user_limit
 from .schemas import ChatMessage, ChatRequest
 from .websearch import web_search
@@ -21,6 +22,66 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 MAX_MESSAGES = 40
 MAX_CONTENT_LEN = 32_000
+TITLE_LEN = 30
+
+
+def _auto_title(content: str) -> str:
+    text = " ".join(content.split())
+    return text[:TITLE_LEN] if text else "新对话"
+
+
+def _persist_user_message(user_id: int, session_id: str, msg: ChatMessage, msg_id: str) -> None:
+    execute(
+        "INSERT OR IGNORE INTO messages (id, session_id, role, content, images, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (msg_id, session_id, msg.role, msg.content, json.dumps(msg.images), now_ms()),
+    )
+
+
+def _persist_assistant(
+    user_id: int, session_id: str, content: str, assistant_msg_id: str, images: list[str]
+) -> None:
+    """流结束后把助手消息与会话元数据在同一事务写入；标题为空时用首条用户消息自动生成。"""
+    now = now_ms()
+    queries: list[tuple[str, list]] = []
+    existing = fetch_one(
+        "SELECT id FROM messages WHERE id = ? AND session_id = ?",
+        (assistant_msg_id, session_id),
+    )
+    if existing:
+        queries.append(
+            (
+                "UPDATE messages SET content = ?, images = ? WHERE id = ? AND session_id = ?",
+                [content, json.dumps(images), assistant_msg_id, session_id],
+            )
+        )
+    elif not content:
+        return
+    else:
+        queries.append(
+            (
+                "INSERT INTO messages (id, session_id, role, content, images, created_at)"
+                " VALUES (?, ?, 'assistant', ?, ?, ?)",
+                [assistant_msg_id, session_id, content, json.dumps(images), now],
+            )
+        )
+    session = fetch_one(
+        "SELECT * FROM sessions WHERE id = ? AND user_id = ?", (session_id, user_id)
+    )
+    if not session:
+        return
+    queries.append(("UPDATE sessions SET updated_at = ? WHERE id = ?", [now, session_id]))
+    if not session["title"]:
+        first_user = fetch_one(
+            "SELECT content FROM messages WHERE session_id = ? AND role = 'user'"
+            " ORDER BY created_at, id LIMIT 1",
+            (session_id,),
+        )
+        if first_user:
+            queries.append(
+                ("UPDATE sessions SET title = ? WHERE id = ?", [_auto_title(first_user["content"]), session_id])
+            )
+    transaction(queries)
 
 
 def _get_model(model_key: str) -> dict:
@@ -68,6 +129,23 @@ def _headers(model: dict) -> dict:
     if model["provider"] != "ollama":
         headers["Authorization"] = f"Bearer {settings.siliconflow_api_key}"
     return headers
+
+
+def _extract_delta(line: str) -> str | None:
+    """从 SSE 的 data 行中提取增量文本（OpenAI 兼容流式块）。"""
+    text = line.strip()
+    if not text.startswith("data:"):
+        return None
+    data = text[5:].strip()
+    if not data or data == "[DONE]":
+        return None
+    try:
+        obj = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+    content = delta.get("content")
+    return content if isinstance(content, str) else None
 
 
 def _extract_usage(line: str) -> dict | None:
@@ -162,6 +240,23 @@ async def chat(
         if len(m.content) > MAX_CONTENT_LEN:
             raise HTTPException(status_code=400, detail="单条消息过长")
 
+    session_id: str | None = None
+    if body.session_id:
+        if not user_id:
+            raise HTTPException(status_code=401, detail="未登录")
+        session = fetch_one(
+            "SELECT * FROM sessions WHERE id = ? AND user_id = ?",
+            (body.session_id, user_id),
+        )
+        if not session:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        session_id = body.session_id
+        last_user = next(
+            (m for m in reversed(body.messages) if m.role == "user"), None
+        )
+        if last_user and body.user_message_id:
+            _persist_user_message(user_id, session_id, last_user, body.user_message_id)
+
     if body.web_search:
         body.messages = await _build_search_context(body)
 
@@ -173,12 +268,16 @@ async def chat(
     if not settings.siliconflow_api_key and model["provider"] != "ollama":
         raise HTTPException(status_code=500, detail="服务端未配置 API key")
 
+    assistant_msg_id = body.assistant_message_id or (
+        f"assistant_{now_ms()}_{secrets.token_hex(4)}" if session_id else ""
+    )
     usage_holder: dict = {}
 
     def error_event(msg: str) -> str:
         return "data: " + json.dumps({"error": msg}) + "\n\n"
 
     async def gen():
+        streamed: list[str] = []
         try:
             timeout = httpx.Timeout(settings.request_timeout, connect=15.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -197,6 +296,9 @@ async def chat(
                         usage = _extract_usage(line)
                         if usage:
                             usage_holder.update(usage)
+                        content = _extract_delta(line)
+                        if content:
+                            streamed.append(content)
                         yield line + "\n\n"
         except httpx.HTTPError as exc:
             yield error_event(f"上游连接中断: {exc}")
@@ -207,6 +309,17 @@ async def chat(
                     "UPDATE users SET last_seen_at = ? WHERE id = ?",
                     (now_ms(), user_id),
                 )
+            if session_id and assistant_msg_id:
+                _persist_assistant(
+                    user_id, session_id, "".join(streamed), assistant_msg_id, []
+                )
+        if session_id:
+            try:
+                yield "data: " + json.dumps(
+                    {"meta": {"assistant_id": assistant_msg_id, "usage": usage_holder or None}}
+                ) + "\n\n"
+            except RuntimeError:
+                pass
 
     from fastapi.responses import StreamingResponse
 

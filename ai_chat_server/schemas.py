@@ -13,6 +13,30 @@ class ChatRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     web_search: bool = False
+    session_id: str | None = None
+    user_message_id: str | None = None
+    assistant_message_id: str | None = None
+
+
+class SessionCreate(BaseModel):
+    title: str = Field(default="", max_length=200)
+    model: str = Field(default="", max_length=100)
+    web_search: bool = False
+
+
+class SessionPatch(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+    model: str | None = Field(default=None, max_length=100)
+    web_search: bool | None = None
+    pinned: bool | None = None
+
+
+class SessionMessageCreate(BaseModel):
+    id: str = Field(max_length=100)
+    role: str = Field(pattern="^(user|assistant|system)$")
+    content: str = Field(default="", max_length=200000)
+    images: list[str] = []
+    timestamp: int = 0
 
 
 class RegisterRequest(BaseModel):
@@ -79,7 +103,9 @@ class ModelPayload(BaseModel):
 
 
 class SettingsPayload(BaseModel):
-    value: str
+    value: str | None = None
+    remark: str | None = None
+    enabled: bool | None = None
 
 
 class SuggestionPayload(BaseModel):

@@ -14,6 +14,7 @@ from .chat import router as chat_router
 from .config import settings
 from .db import init_db
 from .models import router as models_router
+from .sessions import router as sessions_router
 
 
 @asynccontextmanager
@@ -37,6 +38,7 @@ app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(models_router)
 app.include_router(admin_router)
+app.include_router(sessions_router)
 
 
 @app.get("/api/health")

@@ -63,7 +63,9 @@ CREATE TABLE IF NOT EXISTS models (
 
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
+  value TEXT NOT NULL,
+  remark TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS suggestions (
@@ -74,6 +76,33 @@ CREATE TABLE IF NOT EXISTS suggestions (
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  web_search INTEGER NOT NULL DEFAULT 0,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  pinned_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user_updated ON sessions (user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  images TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages (session_id, created_at, id);
 """
 
 _lock = threading.Lock()
@@ -87,6 +116,7 @@ def _connect() -> sqlite3.Connection:
         _conn = sqlite3.connect(settings.db_path, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA foreign_keys=ON")
     return _conn
 
 
@@ -109,6 +139,25 @@ def _migrate() -> None:
         col = ddl.split()[0]
         if col not in cols:
             conn.execute(f"ALTER TABLE users ADD COLUMN {ddl}")
+    settings_cols = {r[1] for r in conn.execute("PRAGMA table_info(settings)")}
+    for ddl in ("remark TEXT NOT NULL DEFAULT ''", "enabled INTEGER NOT NULL DEFAULT 1"):
+        col = ddl.split()[0]
+        if col not in settings_cols:
+            conn.execute(f"ALTER TABLE settings ADD COLUMN {ddl}")
+    conn.commit()
+
+
+def _seed_settings(conn: sqlite3.Connection) -> None:
+    """对话分页等默认配置项：缺失时写入默认值（含备注与启用状态）。"""
+    defaults = [
+        ("chat_initial_page_size", "10", "会话首次打开时加载的最新消息条数"),
+        ("chat_page_size", "10", "向上滚动时每次加载的更早消息条数"),
+    ]
+    for key, value, remark in defaults:
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value, remark, enabled) VALUES (?, ?, ?, 1)",
+            (key, value, remark),
+        )
     conn.commit()
 
 
@@ -138,6 +187,7 @@ def init_db() -> None:
         conn.commit()
         _migrate()
         _seed_suggestions(conn)
+        _seed_settings(conn)
 
 
 def fetch_all(sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
@@ -166,6 +216,20 @@ def execute_many(sql: str, seq: Sequence[Sequence[Any]]) -> None:
         conn = _connect()
         conn.executemany(sql, seq)
         conn.commit()
+
+
+def transaction(queries: Sequence[tuple[str, Sequence[Any]]]) -> None:
+    """多条写入在同一事务内提交；任一条失败则整体回滚。"""
+    with _lock:
+        conn = _connect()
+        try:
+            conn.execute("BEGIN")
+            for sql, params in queries:
+                conn.execute(sql, params)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def now_ms() -> int:
