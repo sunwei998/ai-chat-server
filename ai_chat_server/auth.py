@@ -1,6 +1,7 @@
 """认证：注册 / 登录 / JWT 签发与校验 / 依赖注入。"""
 
 import time
+from datetime import date
 
 import bcrypt
 import jwt
@@ -9,13 +10,24 @@ from jwt import InvalidTokenError
 
 from .config import settings
 from .db import execute, fetch_one, now_ms
-from .geo import resolve_ip
 from .limiter import check_ip_limit
 from .schemas import LoginRequest, ProfileUpdate, RegisterRequest
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 _ALG = "HS256"
+
+
+def compute_age(birthday: str | None) -> int | None:
+    """由生日(YYYY-MM-DD)推算年龄；缺失或格式非法返回 None。"""
+    if not birthday:
+        return None
+    try:
+        b = date.fromisoformat(birthday)
+    except ValueError:
+        return None
+    today = date.today()
+    return today.year - b.year - ((today.month, today.day) < (b.month, b.day))
 
 
 def hash_password(password: str) -> str:
@@ -79,14 +91,13 @@ def register(body: RegisterRequest, request: Request):
     if exists:
         raise HTTPException(status_code=409, detail="用户名已存在")
     ip = request.client.host if request.client else None
-    if body.province or body.city or body.district:
-        province, city, district = body.province, body.city, body.district
-    else:
-        province, city, district = resolve_ip(ip)
+    # 注册仅需账号密码；地区、生日等由用户后续在“资料修改”中自行完善
+    province, city, district = body.province, body.city, body.district
+    age = compute_age(body.birthday) if body.birthday else body.age
     user_id = execute(
-        "INSERT INTO users (username, password_hash, role, province, city, district, age, gender, updated_at, updated_by, created_at)"
-        " VALUES (?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?)",
-        (body.username, hash_password(body.password), province, city, district, body.age, body.gender, now_ms(), body.username, now_ms()),
+        "INSERT INTO users (username, password_hash, role, province, city, district, age, birthday, gender, updated_at, updated_by, created_at)"
+        " VALUES (?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (body.username, hash_password(body.password), province, city, district, age, body.birthday or "", body.gender, now_ms(), body.username, now_ms()),
     )
     _log_login(user_id, True, ip)
     return {
@@ -98,7 +109,8 @@ def register(body: RegisterRequest, request: Request):
             "province": province,
             "city": city,
             "district": district,
-            "age": body.age,
+            "birthday": body.birthday or "",
+            "age": age,
             "gender": body.gender,
         },
     }
@@ -143,6 +155,7 @@ def _username_changes_left(user: dict) -> int:
 
 
 def _user_payload(user: dict) -> dict:
+    birthday = user.get("birthday", "")
     return {
         "id": user["id"],
         "username": user["username"],
@@ -150,7 +163,8 @@ def _user_payload(user: dict) -> dict:
         "province": user.get("province", ""),
         "city": user.get("city", ""),
         "district": user.get("district", ""),
-        "age": user.get("age"),
+        "birthday": birthday,
+        "age": compute_age(birthday) if birthday else user.get("age"),
         "gender": user.get("gender", ""),
         "avatar": user.get("avatar", ""),
         "username_changes_left": _username_changes_left(user),
@@ -185,7 +199,14 @@ def update_me(body: ProfileUpdate, user: dict = Depends(get_current_user)):
             updates.append("username_changed_at = ?")
             params.append(now_ms())
 
-    for col in ("avatar", "age", "gender", "province", "city", "district"):
+    if "birthday" in fields:
+        bd = body.birthday or ""
+        updates.append("birthday = ?")
+        params.append(bd)
+        updates.append("age = ?")
+        params.append(compute_age(bd))
+
+    for col in ("avatar", "gender", "province", "city", "district"):
         if col in fields:
             updates.append(f"{col} = ?")
             params.append(getattr(body, col))

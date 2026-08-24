@@ -3,6 +3,7 @@
 使用标准库 sqlite3 + 原生 SQL，文件数据库，零外部依赖。
 """
 
+import json
 import os
 import sqlite3
 import threading
@@ -129,6 +130,7 @@ def _migrate() -> None:
         "city TEXT DEFAULT ''",
         "district TEXT DEFAULT ''",
         "age INTEGER",
+        "birthday TEXT DEFAULT ''",
         "gender TEXT DEFAULT ''",
         "avatar TEXT DEFAULT ''",
         "username_changed_at INTEGER",
@@ -148,10 +150,39 @@ def _migrate() -> None:
 
 
 def _seed_settings(conn: sqlite3.Connection) -> None:
-    """对话分页等默认配置项：缺失时写入默认值（含备注与启用状态）。"""
+    """对话分页、模型提供方数据字典等默认配置项：缺失时写入默认值。"""
     defaults = [
         ("chat_initial_page_size", "10", "会话首次打开时加载的最新消息条数"),
         ("chat_page_size", "10", "向上滚动时每次加载的更早消息条数"),
+        (
+            "model_providers",
+            json.dumps(
+                [
+                    {"id": "openai", "name": "OpenAI"},
+                    {"id": "anthropic", "name": "Anthropic Claude"},
+                    {"id": "google", "name": "Google Gemini"},
+                    {"id": "deepseek", "name": "DeepSeek"},
+                    {"id": "qwen", "name": "通义千问 Qwen"},
+                    {"id": "zhipu", "name": "智谱 GLM"},
+                    {"id": "moonshot", "name": "Moonshot Kimi"},
+                    {"id": "doubao", "name": "豆包 Doubao"},
+                    {"id": "baidu", "name": "百度文心 ERNIE"},
+                    {"id": "tencent", "name": "腾讯混元 Hunyuan"},
+                    {"id": "minimax", "name": "MiniMax"},
+                    {"id": "mistral", "name": "Mistral"},
+                    {"id": "meta", "name": "Meta Llama"},
+                    {"id": "groq", "name": "Groq"},
+                    {"id": "openrouter", "name": "OpenRouter"},
+                    {"id": "cohere", "name": "Cohere"},
+                    {"id": "xai", "name": "xAI Grok"},
+                    {"id": "stepfun", "name": "阶跃星辰 StepFun"},
+                    {"id": "siliconflow", "name": "硅基流动 SiliconFlow"},
+                    {"id": "ollama", "name": "Ollama"},
+                ],
+                ensure_ascii=False,
+            ),
+            "模型提供方数据字典（JSON 数组：[{\"id\",\"name\"}]）",
+        ),
     ]
     for key, value, remark in defaults:
         conn.execute(

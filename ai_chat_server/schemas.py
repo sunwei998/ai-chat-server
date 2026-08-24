@@ -42,7 +42,8 @@ class SessionMessageCreate(BaseModel):
 class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=8, max_length=128)
-    age: int = Field(ge=1, le=120)
+    age: int | None = Field(default=None, ge=1, le=120)
+    birthday: str | None = Field(default=None, max_length=16)
     gender: str = Field(default="", max_length=16)
     province: str = Field(default="", max_length=32)
     city: str = Field(default="", max_length=32)
@@ -75,13 +76,14 @@ class UserUpdate(BaseModel):
     city: str | None = Field(default=None, max_length=32)
     district: str | None = Field(default=None, max_length=32)
     age: int | None = Field(default=None, ge=1, le=120)
+    birthday: str | None = Field(default=None, max_length=16)
     gender: str | None = Field(default=None, pattern="^(male|female|other)$")
 
 
 class ProfileUpdate(BaseModel):
     username: str | None = Field(default=None, min_length=3, max_length=32)
     avatar: str | None = Field(default=None, max_length=400000)
-    age: int | None = Field(default=None, ge=1, le=120)
+    birthday: str | None = Field(default=None, max_length=16)
     gender: str | None = Field(default=None, pattern="^(male|female|other)?$")
     province: str | None = Field(default=None, max_length=32)
     city: str | None = Field(default=None, max_length=32)

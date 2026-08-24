@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from .auth import hash_password, require_admin
+from .auth import compute_age, hash_password, require_admin
 from .db import execute, fetch_all, fetch_one, now_ms
 from .schemas import (
     ModelPayload,
@@ -54,12 +54,127 @@ def stats():
     }
 
 
+@router.get("/overview")
+def overview():
+    """管理台概览：核心指标 + 多维图表数据（趋势/时段/新增/排行/画像）。"""
+    now = now_ms()
+    start30 = now - 30 * _DAY_MS
+
+    users = fetch_one("SELECT COUNT(*) AS n FROM users")["n"]
+    active_today = fetch_one(
+        "SELECT COUNT(DISTINCT user_id) AS n FROM token_usage WHERE created_at >= ?",
+        (now - _DAY_MS,),
+    )["n"]
+    active_7d = fetch_one(
+        "SELECT COUNT(DISTINCT user_id) AS n FROM token_usage WHERE created_at >= ?",
+        (now - 7 * _DAY_MS,),
+    )["n"]
+    total_tokens = fetch_one(
+        "SELECT COALESCE(SUM(total_tokens), 0) AS n FROM token_usage"
+    )["n"]
+    today_tokens = fetch_one(
+        "SELECT COALESCE(SUM(total_tokens), 0) AS n FROM token_usage WHERE created_at >= ?",
+        (now - _DAY_MS,),
+    )["n"]
+    requests = fetch_one("SELECT COUNT(*) AS n FROM token_usage")["n"]
+
+    daily = fetch_all(
+        """
+        SELECT (created_at / 86400000) AS day, COUNT(*) AS requests,
+               COALESCE(SUM(total_tokens), 0) AS total
+        FROM token_usage WHERE created_at >= ? GROUP BY day ORDER BY day
+        """,
+        (start30,),
+    )
+
+    hourly = fetch_all(
+        """
+        SELECT (created_at / 3600000) % 24 AS hour, COUNT(*) AS requests,
+               COALESCE(SUM(total_tokens), 0) AS total
+        FROM token_usage WHERE created_at >= ? GROUP BY hour ORDER BY hour
+        """,
+        (start30,),
+    )
+
+    new_users = fetch_all(
+        """
+        SELECT (created_at / 86400000) AS day, COUNT(*) AS n
+        FROM users WHERE created_at >= ? GROUP BY day ORDER BY day
+        """,
+        (start30,),
+    )
+
+    by_model = fetch_all(
+        """
+        SELECT model_key, COUNT(*) AS requests,
+               COALESCE(SUM(total_tokens), 0) AS total
+        FROM token_usage WHERE created_at >= ?
+        GROUP BY model_key ORDER BY total DESC LIMIT 8
+        """,
+        (start30,),
+    )
+
+    top_users = fetch_all(
+        """
+        SELECT u.username, u.avatar, u.province, u.city,
+               COALESCE(SUM(t.total_tokens), 0) AS total,
+               COUNT(t.id) AS requests
+        FROM users u JOIN token_usage t ON t.user_id = u.id
+        WHERE t.created_at >= ?
+        GROUP BY u.id ORDER BY total DESC LIMIT 8
+        """,
+        (start30,),
+    )
+
+    top_provinces = fetch_all(
+        """
+        SELECT u.province,
+               COUNT(DISTINCT t.user_id) AS active_users,
+               COUNT(t.id) AS requests,
+               COALESCE(SUM(t.total_tokens), 0) AS total_tokens
+        FROM users u JOIN token_usage t ON t.user_id = u.id
+        WHERE u.province != '' AND t.created_at >= ?
+        GROUP BY u.province ORDER BY active_users DESC, total_tokens DESC LIMIT 8
+        """,
+        (start30,),
+    )
+
+    recent_users = fetch_all(
+        """
+        SELECT username, avatar, province, city, district, created_at
+        FROM users ORDER BY created_at DESC LIMIT 8
+        """
+    )
+
+    age_dist, gender_dist = _aggregate_demographics()
+
+    return {
+        "stats": {
+            "users": users,
+            "active_today": active_today,
+            "active_7d": active_7d,
+            "total_tokens": total_tokens,
+            "today_tokens": today_tokens,
+            "requests": requests,
+        },
+        "daily": [dict(r) for r in daily],
+        "hourly": [dict(r) for r in hourly],
+        "new_users": [dict(r) for r in new_users],
+        "by_model": [dict(r) for r in by_model],
+        "top_users": [dict(r) for r in top_users],
+        "top_provinces": [dict(r) for r in top_provinces],
+        "recent_users": [dict(r) for r in recent_users],
+        "age_dist": age_dist,
+        "gender_dist": gender_dist,
+    }
+
+
 @router.get("/users")
 def list_users():
     rows = fetch_all(
         """
         SELECT u.id, u.username, u.role, u.is_active, u.created_at, u.last_seen_at,
-               u.province, u.city, u.district, u.age, u.gender,
+               u.province, u.city, u.district, u.age, u.birthday, u.gender,
                u.updated_at, u.updated_by,
                COALESCE((SELECT COUNT(*) FROM login_logs l WHERE l.user_id = u.id AND l.success = 1), 0) AS logins,
                COALESCE((SELECT SUM(t.total_tokens) FROM token_usage t WHERE t.user_id = u.id), 0) AS total_tokens
@@ -93,6 +208,11 @@ def update_user(user_id: int, body: UserUpdate, admin: dict = Depends(require_ad
     if body.age is not None:
         sets.append("age = ?")
         params.append(body.age)
+    if body.birthday is not None:
+        sets.append("birthday = ?")
+        params.append(body.birthday)
+        sets.append("age = ?")
+        params.append(compute_age(body.birthday) if body.birthday else None)
     if body.gender is not None:
         sets.append("gender = ?")
         params.append(body.gender)
@@ -164,12 +284,12 @@ _GENDER_ORDER = ["male", "female", "other", "unknown"]
 
 
 def _aggregate_demographics() -> tuple[list[dict], list[dict]]:
-    """按行业标准年龄段与性别聚合用户分布；空值归为 unknown。"""
-    rows = fetch_all("SELECT age, gender FROM users")
+    """按行业标准年龄段与性别聚合用户分布；未填写(生日/性别)统一归为 unknown。"""
+    rows = fetch_all("SELECT age, birthday, gender FROM users")
     age_map = {k: 0 for k in _AGE_ORDER}
     gender_map = {k: 0 for k in _GENDER_ORDER}
     for r in rows:
-        age = r["age"]
+        age = compute_age(r["birthday"]) if r["birthday"] else r["age"]
         if age is None:
             age_key = "unknown"
         elif age < 18:
