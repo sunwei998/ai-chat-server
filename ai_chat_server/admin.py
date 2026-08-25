@@ -8,7 +8,6 @@ from .schemas import (
     ModelPayload,
     ResetPasswordRequest,
     SettingsPayload,
-    SuggestionPayload,
     UserUpdate,
 )
 
@@ -404,14 +403,15 @@ def create_model(body: ModelPayload):
     if exists:
         raise HTTPException(status_code=409, detail="model_key 已存在")
     execute(
-        "INSERT INTO models (model_key, name, provider, free, vision, enabled, sort_order, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO models (model_key, name, provider, free, vision, supports_search, enabled, sort_order, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             body.model_key,
             body.name,
             body.provider,
             1 if body.free else 0,
             1 if body.vision else 0,
+            1 if body.supports_search else 0,
             1 if body.enabled else 0,
             body.sort_order,
             now_ms(),
@@ -426,13 +426,14 @@ def update_model(model_id: int, body: ModelPayload):
     if not row:
         raise HTTPException(status_code=404, detail="模型不存在")
     execute(
-        "UPDATE models SET model_key=?, name=?, provider=?, free=?, vision=?, enabled=?, sort_order=? WHERE id=?",
+        "UPDATE models SET model_key=?, name=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=? WHERE id=?",
         (
             body.model_key,
             body.name,
             body.provider,
             1 if body.free else 0,
             1 if body.vision else 0,
+            1 if body.supports_search else 0,
             1 if body.enabled else 0,
             body.sort_order,
             model_id,
@@ -473,50 +474,4 @@ def update_setting(key: str, body: SettingsPayload):
     if updates:
         params.append(key)
         execute(f"UPDATE settings SET {', '.join(updates)} WHERE key = ?", params)
-    return {"ok": True}
-
-
-@router.get("/suggestions")
-def list_suggestions():
-    rows = fetch_all("SELECT * FROM suggestions ORDER BY sort_order, id")
-    return [dict(r) for r in rows]
-
-
-@router.post("/suggestions")
-def create_suggestion(body: SuggestionPayload):
-    execute(
-        "INSERT INTO suggestions (title_zh, title_en, sort_order, enabled, created_at)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (
-            body.title_zh,
-            body.title_en,
-            body.sort_order,
-            1 if body.enabled else 0,
-            now_ms(),
-        ),
-    )
-    return {"ok": True}
-
-
-@router.put("/suggestions/{suggestion_id}")
-def update_suggestion(suggestion_id: int, body: SuggestionPayload):
-    row = fetch_one("SELECT id FROM suggestions WHERE id = ?", (suggestion_id,))
-    if not row:
-        raise HTTPException(status_code=404, detail="热词不存在")
-    execute(
-        "UPDATE suggestions SET title_zh=?, title_en=?, sort_order=?, enabled=? WHERE id=?",
-        (
-            body.title_zh,
-            body.title_en,
-            body.sort_order,
-            1 if body.enabled else 0,
-            suggestion_id,
-        ),
-    )
-    return {"ok": True}
-
-
-@router.delete("/suggestions/{suggestion_id}")
-def delete_suggestion(suggestion_id: int):
-    execute("DELETE FROM suggestions WHERE id = ?", (suggestion_id,))
     return {"ok": True}

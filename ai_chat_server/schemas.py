@@ -100,6 +100,7 @@ class ModelPayload(BaseModel):
     provider: str = "openai"
     free: bool = False
     vision: bool = False
+    supports_search: bool = True
     enabled: bool = True
     sort_order: int = 0
 
@@ -108,10 +109,3 @@ class SettingsPayload(BaseModel):
     value: str | None = None
     remark: str | None = None
     enabled: bool | None = None
-
-
-class SuggestionPayload(BaseModel):
-    title_zh: str = Field(min_length=1, max_length=60)
-    title_en: str = Field(min_length=1, max_length=60)
-    sort_order: int = 0
-    enabled: bool = True

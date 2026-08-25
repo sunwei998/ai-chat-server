@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS models (
   provider TEXT NOT NULL DEFAULT 'openai',
   free INTEGER NOT NULL DEFAULT 0,
   vision INTEGER NOT NULL DEFAULT 0,
+  supports_search INTEGER NOT NULL DEFAULT 1,
   enabled INTEGER NOT NULL DEFAULT 1,
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
@@ -67,15 +68,6 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL,
   remark TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS suggestions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  title_zh TEXT NOT NULL,
-  title_en TEXT NOT NULL,
-  sort_order INTEGER NOT NULL DEFAULT 0,
-  enabled INTEGER NOT NULL DEFAULT 1,
-  created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -99,11 +91,13 @@ CREATE TABLE IF NOT EXISTS messages (
   role TEXT NOT NULL,
   content TEXT NOT NULL DEFAULT '',
   images TEXT NOT NULL DEFAULT '[]',
+  citations TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL,
   FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages (session_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_messages_role_created ON messages (role, created_at);
 """
 
 _lock = threading.Lock()
@@ -146,6 +140,12 @@ def _migrate() -> None:
         col = ddl.split()[0]
         if col not in settings_cols:
             conn.execute(f"ALTER TABLE settings ADD COLUMN {ddl}")
+    msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "citations" not in msg_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN citations TEXT NOT NULL DEFAULT '[]'")
+    model_cols = {r[1] for r in conn.execute("PRAGMA table_info(models)")}
+    if "supports_search" not in model_cols:
+        conn.execute("ALTER TABLE models ADD COLUMN supports_search INTEGER NOT NULL DEFAULT 1")
     conn.commit()
 
 
@@ -183,6 +183,26 @@ def _seed_settings(conn: sqlite3.Connection) -> None:
             ),
             "模型提供方数据字典（JSON 数组：[{\"id\",\"name\"}]）",
         ),
+        # 联网搜索默认配置（缺失时写入，使 init 即生效、后台可读可改）
+        (
+            "websearch_providers",
+            json.dumps(
+                [
+                    {"id": "baidu", "label": "百度 (中文最佳)", "enabled": True},
+                    {"id": "searxng", "label": "SearXNG (推荐)", "enabled": True},
+                    {"id": "bing", "label": "Bing RSS", "enabled": True},
+                    {"id": "ddg", "label": "DuckDuckGo HTML", "enabled": True},
+                ],
+                ensure_ascii=False,
+            ),
+            "搜索供应商（JSON 数组：[{\"id\",\"label\",\"enabled\"}]，顺序即优先级）",
+        ),
+        ("searxng_url", "https://search.bus-hit.me", "SearXNG 实例地址"),
+        ("searxng_timeout", "10", "SearXNG 请求超时（秒）"),
+        ("websearch_max_results", "6", "搜索结果条数（1-20）"),
+        ("websearch_max_pages", "3", "抓取正文的条数"),
+        ("websearch_fetch_content", "true", "是否抓取网页正文"),
+        ("websearch_max_content", "12000", "单条正文最大长度（字符）"),
     ]
     for key, value, remark in defaults:
         conn.execute(
@@ -192,32 +212,12 @@ def _seed_settings(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _seed_suggestions(conn: sqlite3.Connection) -> None:
-    """热词表为空时写入默认推荐词（与前端 i18n 默认一致）。"""
-    n = conn.execute("SELECT COUNT(*) AS n FROM suggestions").fetchone()["n"]
-    if n:
-        return
-    defaults = [
-        ("请解释一下量子计算", "Explain quantum computing"),
-        ("如何学习编程？", "How do I learn programming?"),
-        ("写一个Python函数", "Write a Python function"),
-        ("讲一个有趣的笑话", "Tell me a funny joke"),
-    ]
-    conn.executemany(
-        "INSERT INTO suggestions (title_zh, title_en, sort_order, enabled, created_at)"
-        " VALUES (?, ?, ?, 1, ?)",
-        [(zh, en, i + 1, now_ms()) for i, (zh, en) in enumerate(defaults)],
-    )
-    conn.commit()
-
-
 def init_db() -> None:
     with _lock:
         conn = _connect()
         conn.executescript(SCHEMA)
         conn.commit()
         _migrate()
-        _seed_suggestions(conn)
         _seed_settings(conn)
 
 

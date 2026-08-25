@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     admin_password: str = "admin123"
     db_path: str = "data/chat.db"
     cors_origins: str = "*"
-    request_timeout: float = 120.0
+    request_timeout: float = 300.0
     login_rate_per_minute: int = 10
     register_rate_per_hour: int = 5
     chat_rate_per_minute: int = 30

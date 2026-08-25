@@ -3,6 +3,7 @@
 用法：uv run python -m ai_chat_server.seed
 """
 
+import json
 import time
 
 from .auth import hash_password
@@ -49,6 +50,21 @@ def seed_admin() -> None:
 DEFAULT_SETTINGS = {
     "site_name": "AI Chat",
     "announcement": "",
+    "websearch_providers": json.dumps(
+        [
+            {"id": "baidu", "label": "百度 (中文最佳)", "enabled": True},
+            {"id": "searxng", "label": "SearXNG (推荐)", "enabled": True},
+            {"id": "bing", "label": "Bing RSS", "enabled": True},
+            {"id": "ddg", "label": "DuckDuckGo HTML", "enabled": True},
+        ],
+        ensure_ascii=False,
+    ),
+    "searxng_url": "https://search.bus-hit.me",
+    "searxng_timeout": "10",
+    "websearch_max_results": "6",
+    "websearch_max_pages": "3",
+    "websearch_fetch_content": "true",
+    "websearch_max_content": "12000",
 }
 
 
@@ -56,7 +72,7 @@ def seed_settings() -> None:
     for key, value in DEFAULT_SETTINGS.items():
         exists = fetch_one("SELECT key FROM settings WHERE key = ?", (key,))
         if not exists:
-            execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, value))
+            execute("INSERT INTO settings (key, value, remark, enabled) VALUES (?, ?, ?, 1)", (key, value, f"默认配置: {key}"))
     print(f"已初始化 {len(DEFAULT_SETTINGS)} 个默认设置")
 
 

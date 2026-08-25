@@ -11,6 +11,7 @@ dependencies = [
     "bcrypt>=5.0.0",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
+    "jieba>=0.42.1",
     "pydantic-settings>=2.15.0",
     "pyjwt>=2.13.0",
     "uvicorn[standard]>=0.52.3",

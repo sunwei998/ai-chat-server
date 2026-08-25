@@ -13,6 +13,7 @@ from .auth import router as auth_router
 from .chat import router as chat_router
 from .config import settings
 from .db import init_db
+from .hotwords import router as hotwords_router
 from .models import router as models_router
 from .sessions import router as sessions_router
 
@@ -38,6 +39,7 @@ app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(models_router)
 app.include_router(admin_router)
+app.include_router(hotwords_router)
 app.include_router(sessions_router)
 
 

@@ -141,12 +141,17 @@ def get_messages(
             images = json.loads(r["images"] or "[]")
         except json.JSONDecodeError:
             images = []
+        try:
+            citations = json.loads(r["citations"] or "[]")
+        except json.JSONDecodeError:
+            citations = []
         result.append(
             {
                 "id": r["id"],
                 "role": r["role"],
                 "content": r["content"],
                 "images": images,
+                "citations": citations,
                 "timestamp": r["created_at"],
             }
         )

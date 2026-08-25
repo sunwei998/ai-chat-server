@@ -5,7 +5,10 @@ API key 只在服务端持有，不会下发给浏览器。
 """
 
 import json
+import logging
+import re
 import secrets
+import time
 from datetime import datetime
 
 import httpx
@@ -19,6 +22,7 @@ from .schemas import ChatMessage, ChatRequest
 from .websearch import web_search
 
 router = APIRouter(prefix="/api", tags=["chat"])
+logger = logging.getLogger(__name__)
 
 MAX_MESSAGES = 40
 MAX_CONTENT_LEN = 32_000
@@ -39,10 +43,16 @@ def _persist_user_message(user_id: int, session_id: str, msg: ChatMessage, msg_i
 
 
 def _persist_assistant(
-    user_id: int, session_id: str, content: str, assistant_msg_id: str, images: list[str]
+    user_id: int,
+    session_id: str,
+    content: str,
+    assistant_msg_id: str,
+    images: list[str],
+    citations: list | None = None,
 ) -> None:
     """流结束后把助手消息与会话元数据在同一事务写入；标题为空时用首条用户消息自动生成。"""
     now = now_ms()
+    citations = citations or []
     queries: list[tuple[str, list]] = []
     existing = fetch_one(
         "SELECT id FROM messages WHERE id = ? AND session_id = ?",
@@ -51,8 +61,8 @@ def _persist_assistant(
     if existing:
         queries.append(
             (
-                "UPDATE messages SET content = ?, images = ? WHERE id = ? AND session_id = ?",
-                [content, json.dumps(images), assistant_msg_id, session_id],
+                "UPDATE messages SET content = ?, images = ?, citations = ? WHERE id = ? AND session_id = ?",
+                [content, json.dumps(images), json.dumps(citations), assistant_msg_id, session_id],
             )
         )
     elif not content:
@@ -60,9 +70,9 @@ def _persist_assistant(
     else:
         queries.append(
             (
-                "INSERT INTO messages (id, session_id, role, content, images, created_at)"
-                " VALUES (?, ?, 'assistant', ?, ?, ?)",
-                [assistant_msg_id, session_id, content, json.dumps(images), now],
+                "INSERT INTO messages (id, session_id, role, content, images, citations, created_at)"
+                " VALUES (?, ?, 'assistant', ?, ?, ?, ?)",
+                [assistant_msg_id, session_id, content, json.dumps(images), json.dumps(citations), now],
             )
         )
     session = fetch_one(
@@ -194,36 +204,120 @@ def _chat_rate_limit(user: dict = Depends(get_current_user)) -> dict:
     return user
 
 
-async def _build_search_context(body: ChatRequest) -> list:
-    """联网搜索：取最后一条用户消息作为查询词，把结果作为 system 消息注入。"""
-    last_user = next(
-        (m.content for m in reversed(body.messages) if m.role == "user" and m.content.strip()),
-        "",
-    )
-    if not last_user:
-        return body.messages
+# 搜索注入预算：正文单条截断、总字符预算（近似 token 控制，防撑爆小模型上下文）
+SEARCH_BUDGET_CHARS = 5000
+SEARCH_CONTENT_CAP = 1200
+MAX_CITATIONS = 6
 
+# 查询词清理：去除常见指令前缀（避免把"帮我搜索 XX"整句拿去搜）
+_QUERY_PREFIXES = (
+    "帮我搜索一下", "帮我搜索", "帮我搜一下", "帮我搜", "帮我查一下", "帮我查",
+    "搜索一下", "搜索", "查找一下", "查找", "查一下", "帮我", "请帮我", "请问", "请",
+    "你好", "您好", "嗨", "hi", "hello",
+)
+
+
+def _clean_query(text: str) -> str:
+    """清理查询词：去指令前缀、剥 markdown 链接、压缩空白、去首尾标点。"""
+    q = text.strip()
+    lowered = q.lower()
+    for pre in _QUERY_PREFIXES:
+        if lowered.startswith(pre.lower()):
+            q = q[len(pre):].strip()
+            break
+    q = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", q)
+    q = re.sub(r"\s+", " ", q).strip(" \t\r\n，。！？,.!?;；:：")
+    return q
+
+
+def _build_search_query(body: ChatRequest) -> str:
+    """取最后一条非空用户消息；清理后过短（纯寒暄）时回退用会话第一条用户消息。"""
+    user_msgs = [m.content for m in body.messages if m.role == "user" and m.content.strip()]
+    if not user_msgs:
+        return ""
+    cleaned = _clean_query(user_msgs[-1])
+    if len(cleaned) < 4:
+        cleaned = _clean_query(user_msgs[0])
+    return cleaned
+
+
+def _with_search_context(body: ChatRequest, content: str) -> list[ChatMessage]:
+    """把搜索上下文作为 user 消息插到最后一条用户消息之前。
+
+    小模型上下文窗口小，消息超长时上游会从最前面开始截断；若搜索内容是第一条
+    system 消息会最先被丢弃，模型根本读不到。紧贴问题注入可最大程度存活。
+    """
+    messages = list(body.messages)
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].role == "user":
+            messages.insert(i, ChatMessage(role="user", content=content))
+            return messages
+    return messages
+
+
+async def _build_search_context(body: ChatRequest, query: str) -> tuple[list[ChatMessage], dict]:
+    """联网搜索并把结果注入上下文；返回 (messages, meta)，meta 含状态/耗时/引用。"""
     now = datetime.now()
     weekday = "一二三四五六日"[now.weekday()]
     current_date = f"{now.year}年{now.month}月{now.day}日（星期{weekday}）"
 
-    try:
-        results = await web_search(last_user)
-    except Exception as exc:  # noqa: BLE001 - 搜索失败不阻断聊天
-        results = f"（联网搜索失败：{exc}。请直接回答用户问题，并说明当前无法获取实时信息。）"
+    started = time.perf_counter()
+    meta: dict = {"query": query}
 
-    system_msg = ChatMessage(
-        role="system",
-        content=(
-            "当前日期："
-            f"{current_date}。\n"
-            "以下是针对用户问题进行的实时联网搜索结果。请优先依据这些信息回答，"
-            "引用来源时可给出对应链接；如果搜索结果与问题无关或信息不足，请如实说明，"
-            "但涉及年份、日期、时间等时效性问题时，应优先使用上面给出的当前日期。\n\n"
-            f"{results}"
-        ),
-    )
-    return [system_msg, *body.messages]
+    try:
+        search_results = await web_search(query, fetch_content=True)
+    except Exception as exc:  # noqa: BLE001 - 搜索失败不阻断聊天
+        meta.update({
+            "status": "failed",
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+            "error": str(exc)[:200],
+            "citations": [],
+        })
+        results_text = "（本次联网搜索失败，请基于自身知识回答，并告知用户暂无实时信息。）"
+        return _with_search_context(body, f"当前日期：{current_date}。\n{results_text}"), meta
+
+    duration_ms = int((time.perf_counter() - started) * 1000)
+
+    if not search_results:
+        meta.update({"status": "no_results", "duration_ms": duration_ms, "citations": []})
+        results_text = "（本次联网搜索未返回有效结果，请基于自身知识回答，并告知用户暂无实时信息。）"
+        return _with_search_context(body, f"当前日期：{current_date}。\n{results_text}"), meta
+
+    # 已按相关度排序；按字符预算逐条拼装，超出即停止，实际注入的条目同时生成 citations
+    context_lines = [
+        "以下是针对用户问题进行的实时联网搜索结果。请优先依据这些信息回答，",
+        "引用来源时可给出对应链接；如果搜索结果与问题无关或信息不足，请如实说明，",
+        "但涉及年份、日期、时间等时效性问题时，应优先使用上面给出的当前日期。",
+        "",
+    ]
+    citations = []
+    budget = 0
+    for r in search_results:
+        block = f"{len(citations) + 1}. {r['title']}"
+        if r.get("link"):
+            block += f"\n   链接：{r['link']}"
+        if r.get("snippet"):
+            block += f"\n   摘要：{r['snippet']}"
+        if r.get("full_content"):
+            block += f"\n   正文：{r['full_content'][:SEARCH_CONTENT_CAP]}"
+        block += "\n"
+        if budget + len(block) > SEARCH_BUDGET_CHARS:
+            break
+        context_lines.append(block)
+        budget += len(block)
+        citations.append({"title": r["title"], "link": r["link"], "source": r.get("source", "")})
+        if len(citations) >= MAX_CITATIONS:
+            break
+
+    results_text = "\n".join(context_lines)
+    meta.update({
+        "status": "done",
+        "count": len(citations),
+        "duration_ms": duration_ms,
+        "sources": sorted({c["source"] for c in citations if c["source"]}),
+        "citations": citations,
+    })
+    return _with_search_context(body, f"当前日期：{current_date}。\n{results_text}"), meta
 
 
 @router.post("/chat")
@@ -257,11 +351,7 @@ async def chat(
         if last_user and body.user_message_id:
             _persist_user_message(user_id, session_id, last_user, body.user_message_id)
 
-    if body.web_search:
-        body.messages = await _build_search_context(body)
-
     model = _get_model(body.model)
-    payload = _build_payload(model, body)
     url = _endpoint(model)
     headers = _headers(model)
 
@@ -278,7 +368,27 @@ async def chat(
 
     async def gen():
         streamed: list[str] = []
+        search_meta: dict | None = None
         try:
+            # 联网搜索在流式生成器内执行：响应头立即返回，先下发搜索状态事件
+            if body.web_search and not model.get("supports_search", 1):
+                # 模型不支持联网搜索：不注入搜索上下文，明确告知前端
+                yield "data: " + json.dumps({
+                    "search": {"status": "unsupported", "query": _build_search_query(body),
+                               "error": "该模型不支持联网搜索", "citations": []}
+                }) + "\n\n"
+            elif body.web_search:
+                try:
+                    query = _build_search_query(body)
+                    yield "data: " + json.dumps({"search": {"status": "started", "query": query}}) + "\n\n"
+                    body.messages, search_meta = await _build_search_context(body, query)
+                    yield "data: " + json.dumps({"search": search_meta}) + "\n\n"
+                except Exception as exc:  # noqa: BLE001 - 搜索阶段异常绝不能让流静默中断
+                    logger.warning("搜索阶段异常: %s", exc)
+                    search_meta = {"status": "failed", "query": query, "error": str(exc)[:200], "citations": []}
+                    yield "data: " + json.dumps({"search": search_meta}) + "\n\n"
+
+            payload = _build_payload(model, body)
             timeout = httpx.Timeout(settings.request_timeout, connect=15.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream(
@@ -302,6 +412,9 @@ async def chat(
                         yield line + "\n\n"
         except httpx.HTTPError as exc:
             yield error_event(f"上游连接中断: {exc}")
+        except Exception as exc:  # noqa: BLE001 - 任何异常都要下发错误事件，不能让流静默中断
+            logger.warning("chat 流异常: %s", exc)
+            yield error_event(f"服务异常: {exc}")
         finally:
             _record_usage(user_id, model["model_key"], usage_holder or None)
             if user_id:
@@ -311,7 +424,8 @@ async def chat(
                 )
             if session_id and assistant_msg_id:
                 _persist_assistant(
-                    user_id, session_id, "".join(streamed), assistant_msg_id, []
+                    user_id, session_id, "".join(streamed), assistant_msg_id, [],
+                    (search_meta or {}).get("citations") or [],
                 )
         if session_id:
             try:
