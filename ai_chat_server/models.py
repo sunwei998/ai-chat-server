@@ -11,7 +11,7 @@ router = APIRouter(prefix="/api", tags=["models"])
 @router.get("/models")
 def list_public_models():
     rows = fetch_all(
-        "SELECT model_key, name, free, vision, supports_search FROM models WHERE enabled = 1 ORDER BY sort_order, id"
+        "SELECT model_key, name, free, vision, supports_search, is_default FROM models WHERE enabled = 1 ORDER BY sort_order, id"
     )
     return [
         {
@@ -20,6 +20,7 @@ def list_public_models():
             "free": bool(r["free"]),
             "vision": bool(r["vision"]),
             "supports_search": bool(r["supports_search"]),
+            "is_default": bool(r["is_default"]),
         }
         for r in rows
     ]

@@ -26,6 +26,11 @@ def seed_models() -> int:
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [(r[0], r[1], r[2], r[3], r[4], r[5], r[6], now_ms()) for r in rows],
     )
+    # 默认模型：优先历史默认 Hunyuan-MT-7B（禁用则该条不生效，由保底逻辑兜底）
+    execute(
+        "UPDATE models SET is_default = 1 WHERE model_key = ? AND enabled = 1",
+        ("tencent/Hunyuan-MT-7B",),
+    )
     print(f"导入 {len(rows)} 个模型")
     return len(rows)
 

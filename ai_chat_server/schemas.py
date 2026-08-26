@@ -103,6 +103,7 @@ class ModelPayload(BaseModel):
     supports_search: bool = True
     enabled: bool = True
     sort_order: int = 0
+    is_default: bool = False
 
 
 class SettingsPayload(BaseModel):

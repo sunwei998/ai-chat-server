@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from .auth import compute_age, hash_password, require_admin
-from .db import execute, fetch_all, fetch_one, now_ms
+from .db import execute, fetch_all, fetch_one, now_ms, transaction
 from .schemas import (
     ModelPayload,
     ResetPasswordRequest,
@@ -402,9 +402,11 @@ def create_model(body: ModelPayload):
     exists = fetch_one("SELECT id FROM models WHERE model_key = ?", (body.model_key,))
     if exists:
         raise HTTPException(status_code=409, detail="model_key 已存在")
-    execute(
-        "INSERT INTO models (model_key, name, provider, free, vision, supports_search, enabled, sort_order, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    if body.is_default and not body.enabled:
+        raise HTTPException(status_code=400, detail="禁用模型不能设为默认模型")
+    new_id = execute(
+        "INSERT INTO models (model_key, name, provider, free, vision, supports_search, enabled, sort_order, is_default, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             body.model_key,
             body.name,
@@ -414,31 +416,72 @@ def create_model(body: ModelPayload):
             1 if body.supports_search else 0,
             1 if body.enabled else 0,
             body.sort_order,
+            1 if body.is_default else 0,
             now_ms(),
         ),
     )
+    if body.is_default:
+        # 设默认时清除其它默认，保证全局唯一
+        transaction([
+            ("UPDATE models SET is_default = 0 WHERE id <> ?", (new_id,)),
+            ("UPDATE models SET is_default = 1 WHERE id = ?", (new_id,)),
+        ])
     return {"ok": True}
 
 
 @router.put("/models/{model_id}")
 def update_model(model_id: int, body: ModelPayload):
-    row = fetch_one("SELECT id FROM models WHERE id = ?", (model_id,))
+    row = fetch_one("SELECT id, enabled, is_default FROM models WHERE id = ?", (model_id,))
     if not row:
         raise HTTPException(status_code=404, detail="模型不存在")
-    execute(
-        "UPDATE models SET model_key=?, name=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=? WHERE id=?",
-        (
-            body.model_key,
-            body.name,
-            body.provider,
-            1 if body.free else 0,
-            1 if body.vision else 0,
-            1 if body.supports_search else 0,
-            1 if body.enabled else 0,
-            body.sort_order,
-            model_id,
-        ),
+
+    effective_enabled = body.enabled if body.enabled is not None else bool(row["enabled"])
+
+    if not body.is_default:
+        # 未请求设为默认：保护与默认相关的约束
+        if body.enabled is False and row["is_default"]:
+            raise HTTPException(status_code=400, detail="默认模型不能被禁用，请先指定其它默认模型")
+        if body.is_default is False and row["is_default"]:
+            raise HTTPException(status_code=400, detail="必须保留一个默认模型，请先指定其它默认模型")
+        # 普通更新，不动 is_default
+        execute(
+            "UPDATE models SET model_key=?, name=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=? WHERE id=?",
+            (
+                body.model_key,
+                body.name,
+                body.provider,
+                1 if body.free else 0,
+                1 if body.vision else 0,
+                1 if body.supports_search else 0,
+                1 if body.enabled else 0,
+                body.sort_order,
+                model_id,
+            ),
+        )
+        return {"ok": True}
+
+    # 请求设为默认：禁用模型不允许
+    if not effective_enabled:
+        raise HTTPException(status_code=400, detail="禁用模型不能设为默认模型")
+    # 清除其它默认 + 更新本行字段并置为默认，保证全局唯一
+    params = (
+        body.model_key,
+        body.name,
+        body.provider,
+        1 if body.free else 0,
+        1 if body.vision else 0,
+        1 if body.supports_search else 0,
+        1 if body.enabled else 0,
+        body.sort_order,
+        model_id,
     )
+    transaction([
+        ("UPDATE models SET is_default = 0 WHERE id <> ?", (model_id,)),
+        (
+            "UPDATE models SET model_key=?, name=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=?, is_default=1 WHERE id=?",
+            params,
+        ),
+    ])
     return {"ok": True}
 
 

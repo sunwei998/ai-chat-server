@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS models (
   supports_search INTEGER NOT NULL DEFAULT 1,
   enabled INTEGER NOT NULL DEFAULT 1,
   sort_order INTEGER NOT NULL DEFAULT 0,
+  is_default INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 
@@ -146,6 +147,8 @@ def _migrate() -> None:
     model_cols = {r[1] for r in conn.execute("PRAGMA table_info(models)")}
     if "supports_search" not in model_cols:
         conn.execute("ALTER TABLE models ADD COLUMN supports_search INTEGER NOT NULL DEFAULT 1")
+    if "is_default" not in model_cols:
+        conn.execute("ALTER TABLE models ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 
@@ -212,6 +215,25 @@ def _seed_settings(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _ensure_default_model(conn: sqlite3.Connection) -> None:
+    """保证 models 表恰好有一个默认模型：无默认时优先保留历史默认
+    tencent/Hunyuan-MT-7B，否则取第一个启用模型；已存在则保持不变。"""
+    row = conn.execute("SELECT id FROM models WHERE is_default = 1 LIMIT 1").fetchone()
+    if row:
+        return
+    candidate = conn.execute(
+        "SELECT id FROM models WHERE model_key = ? AND enabled = 1",
+        ("tencent/Hunyuan-MT-7B",),
+    ).fetchone()
+    if not candidate:
+        candidate = conn.execute(
+            "SELECT id FROM models WHERE enabled = 1 ORDER BY sort_order, id LIMIT 1"
+        ).fetchone()
+    if candidate:
+        conn.execute("UPDATE models SET is_default = 1 WHERE id = ?", (candidate["id"],))
+        conn.commit()
+
+
 def init_db() -> None:
     with _lock:
         conn = _connect()
@@ -219,6 +241,7 @@ def init_db() -> None:
         conn.commit()
         _migrate()
         _seed_settings(conn)
+        _ensure_default_model(conn)
 
 
 def fetch_all(sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
