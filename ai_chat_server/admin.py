@@ -1,6 +1,6 @@
 """管理端 API：概览统计 / 用户管理 / 用量统计 / 模型配置 / 系统设置。"""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .auth import compute_age, hash_password, require_admin
 from .db import execute, fetch_all, fetch_one, now_ms, transaction
@@ -169,18 +169,27 @@ def overview():
 
 
 @router.get("/users")
-def list_users():
+def list_users(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100), search: str = ""):
+    offset = (page - 1) * page_size
+    where = ""
+    params: list = []
+    if search:
+        where = "WHERE u.username LIKE ?"
+        params.append(f"%{search}%")
+    total = fetch_one(f"SELECT COUNT(*) AS n FROM users u {where}", params)["n"]
     rows = fetch_all(
-        """
+        f"""
         SELECT u.id, u.username, u.role, u.is_active, u.created_at, u.last_seen_at,
                u.province, u.city, u.district, u.age, u.birthday, u.gender,
                u.updated_at, u.updated_by,
                COALESCE((SELECT COUNT(*) FROM login_logs l WHERE l.user_id = u.id AND l.success = 1), 0) AS logins,
                COALESCE((SELECT SUM(t.total_tokens) FROM token_usage t WHERE t.user_id = u.id), 0) AS total_tokens
-        FROM users u ORDER BY u.created_at DESC
-        """
+        FROM users u {where} ORDER BY u.created_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (*params, page_size, offset),
     )
-    return [dict(r) for r in rows]
+    return {"items": [dict(r) for r in rows], "total": total, "page": page, "pageSize": page_size}
 
 
 @router.get("/users/{user_id}")
@@ -410,9 +419,19 @@ def region_stats(period: str = "month"):
 
 
 @router.get("/models")
-def list_models():
-    rows = fetch_all("SELECT * FROM models ORDER BY sort_order, id")
-    return [dict(r) for r in rows]
+def list_models(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100), search: str = ""):
+    offset = (page - 1) * page_size
+    where = ""
+    params: list = []
+    if search:
+        where = "WHERE model_key LIKE ? OR name LIKE ? OR provider LIKE ?"
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+    total = fetch_one(f"SELECT COUNT(*) AS n FROM models {where}", params)["n"]
+    rows = fetch_all(
+        f"SELECT * FROM models {where} ORDER BY sort_order, id LIMIT ? OFFSET ?",
+        (*params, page_size, offset),
+    )
+    return {"items": [dict(r) for r in rows], "total": total, "page": page, "pageSize": page_size}
 
 
 @router.get("/models/{model_id}")
@@ -518,9 +537,19 @@ def delete_model(model_id: int):
 
 
 @router.get("/settings")
-def list_settings():
-    rows = fetch_all("SELECT * FROM settings ORDER BY key")
-    return [dict(r) for r in rows]
+def list_settings(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100), search: str = ""):
+    offset = (page - 1) * page_size
+    where = ""
+    params: list = []
+    if search:
+        where = "WHERE key LIKE ? OR value LIKE ? OR remark LIKE ?"
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+    total = fetch_one(f"SELECT COUNT(*) AS n FROM settings {where}", params)["n"]
+    rows = fetch_all(
+        f"SELECT * FROM settings {where} ORDER BY key LIMIT ? OFFSET ?",
+        (*params, page_size, offset),
+    )
+    return {"items": [dict(r) for r in rows], "total": total, "page": page, "pageSize": page_size}
 
 
 @router.patch("/settings/{key}")
