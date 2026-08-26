@@ -183,6 +183,24 @@ def list_users():
     return [dict(r) for r in rows]
 
 
+@router.get("/users/{user_id}")
+def get_user(user_id: int):
+    row = fetch_one(
+        """
+        SELECT u.id, u.username, u.role, u.is_active, u.created_at, u.last_seen_at,
+               u.province, u.city, u.district, u.age, u.birthday, u.gender,
+               u.updated_at, u.updated_by,
+               COALESCE((SELECT COUNT(*) FROM login_logs l WHERE l.user_id = u.id AND l.success = 1), 0) AS logins,
+               COALESCE((SELECT SUM(t.total_tokens) FROM token_usage t WHERE t.user_id = u.id), 0) AS total_tokens
+        FROM users u WHERE u.id = ?
+        """,
+        (user_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return dict(row)
+
+
 @router.patch("/users/{user_id}")
 def update_user(user_id: int, body: UserUpdate, admin: dict = Depends(require_admin)):
     row = fetch_one("SELECT * FROM users WHERE id = ?", (user_id,))
@@ -395,6 +413,14 @@ def region_stats(period: str = "month"):
 def list_models():
     rows = fetch_all("SELECT * FROM models ORDER BY sort_order, id")
     return [dict(r) for r in rows]
+
+
+@router.get("/models/{model_id}")
+def get_model(model_id: int):
+    row = fetch_one("SELECT * FROM models WHERE id = ?", (model_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    return dict(row)
 
 
 @router.post("/models")
