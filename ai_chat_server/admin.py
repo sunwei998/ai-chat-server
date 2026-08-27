@@ -169,13 +169,34 @@ def overview():
 
 
 @router.get("/users")
-def list_users(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100), search: str = ""):
+def list_users(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str = "",
+    username: str = "",
+    gender: str = "",
+    role: str = "",
+):
     offset = (page - 1) * page_size
-    where = ""
+    clauses: list[str] = []
     params: list = []
     if search:
-        where = "WHERE u.username LIKE ?"
+        clauses.append("u.username LIKE ?")
         params.append(f"%{search}%")
+    if username:
+        clauses.append("u.username LIKE ?")
+        params.append(f"%{username}%")
+    if gender:
+        genders = [g.strip() for g in gender.split(",") if g.strip()]
+        if genders:
+            clauses.append("u.gender IN (" + ",".join("?" for _ in genders) + ")")
+            params.extend(genders)
+    if role:
+        roles = [r.strip() for r in role.split(",") if r.strip()]
+        if roles:
+            clauses.append("u.role IN (" + ",".join("?" for _ in roles) + ")")
+            params.extend(roles)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     total = fetch_one(f"SELECT COUNT(*) AS n FROM users u {where}", params)["n"]
     rows = fetch_all(
         f"""
