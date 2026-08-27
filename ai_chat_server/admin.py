@@ -1,6 +1,9 @@
-"""管理端 API：概览统计 / 用户管理 / 用量统计 / 模型配置 / 系统设置。"""
+"""管理端 API：概览统计 / 用户管理 / 用量统计 / 模型配置 / 系统设置 / 导入导出记录。"""
+
+import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 
 from .auth import (
     ROLE_SUPER_ADMIN,
@@ -11,6 +14,7 @@ from .auth import (
     require_settings_admin,
     require_super_admin,
 )
+from .config import settings
 from .db import execute, fetch_all, fetch_one, now_ms, transaction
 from .schemas import (
     ModelPayload,
@@ -362,8 +366,16 @@ _GENDER_ORDER = ["male", "female", "other", "unknown"]
 
 
 def _aggregate_demographics() -> tuple[list[dict], list[dict]]:
-    """按行业标准年龄段与性别聚合用户分布；未填写(生日/性别)统一归为 unknown。"""
-    rows = fetch_all("SELECT age, birthday, gender FROM users")
+    """按行业标准年龄段与性别聚合：
+    - 年龄分布统计 Token 消耗量（按年龄分组的 token_usage 总量）
+    - 性别分布统计用户人数；未填写(生日/性别)统一归为 unknown。"""
+    rows = fetch_all(
+        """
+        SELECT u.age, u.birthday, u.gender, COALESCE(SUM(t.total_tokens), 0) AS tokens
+        FROM users u LEFT JOIN token_usage t ON t.user_id = u.id
+        GROUP BY u.id
+        """
+    )
     age_map = {k: 0 for k in _AGE_ORDER}
     gender_map = {k: 0 for k in _GENDER_ORDER}
     for r in rows:
@@ -384,7 +396,7 @@ def _aggregate_demographics() -> tuple[list[dict], list[dict]]:
             age_key = "55-64"
         else:
             age_key = "65+"
-        age_map[age_key] += 1
+        age_map[age_key] += r["tokens"]
         g = (r["gender"] or "").strip().lower()
         gender_key = g if g in ("male", "female", "other") else "unknown"
         gender_map[gender_key] += 1
@@ -677,3 +689,65 @@ def update_setting(key: str, body: SettingsPayload, admin: dict = Depends(requir
         params.append(key)
         execute(f"UPDATE settings SET {', '.join(updates)} WHERE key = ?", params)
     return {"ok": True}
+
+
+# ============ 导入 / 导出记录（所有管理员可见，可下载源文件） ============
+
+_TRANSFER_DIR = os.path.join(os.path.dirname(settings.db_path) or ".", "transfers")
+
+
+@router.get("/transfers")
+def list_transfers(
+    type: str = Query("import", description="import / export"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    sort: str = "",
+    order: str = "desc",
+):
+    if type not in ("import", "export"):
+        raise HTTPException(status_code=400, detail="type 仅支持 import/export")
+    offset = (page - 1) * page_size
+    clauses = ["type = ?"]
+    params: list = [type]
+    where = "WHERE " + " AND ".join(clauses)
+    sort_columns = {
+        "id": "id",
+        "filename": "filename",
+        "username": "username",
+        "file_size": "file_size",
+        "created_at": "created_at",
+    }
+    order_by = "created_at DESC, id DESC"
+    if sort in sort_columns:
+        direction = "ASC" if order.strip().lower() == "asc" else "DESC"
+        order_by = f"{sort_columns[sort]} {direction}, id DESC"
+    total = fetch_one(f"SELECT COUNT(*) AS n FROM transfer_records {where}", params)["n"]
+    rows = fetch_all(
+        f"SELECT * FROM transfer_records {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
+        (*params, page_size, offset),
+    )
+    items = []
+    for r in rows:
+        d = dict(r)
+        d["has_file"] = bool(d.get("file_path")) and os.path.isfile(d["file_path"])
+        items.append(d)
+    return {"items": items, "total": total, "page": page, "pageSize": page_size}
+
+
+@router.get("/transfers/{record_id}/download")
+def download_transfer(record_id: int):
+    row = fetch_one("SELECT * FROM transfer_records WHERE id = ?", (record_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    file_path = row["file_path"]
+    if not file_path:
+        raise HTTPException(status_code=404, detail="该记录没有源文件")
+    # 防路径穿越：强制限制在 transfers 目录内
+    base = os.path.abspath(_TRANSFER_DIR)
+    full = os.path.abspath(file_path)
+    if not (full == base or full.startswith(base + os.sep)):
+        raise HTTPException(status_code=400, detail="非法文件路径")
+    if not os.path.isfile(full):
+        raise HTTPException(status_code=404, detail="源文件不存在或已被清理")
+    media_type = row["mime_type"] or "application/octet-stream"
+    return FileResponse(full, filename=row["filename"], media_type=media_type)

@@ -99,6 +99,21 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages (session_id, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_messages_role_created ON messages (role, created_at);
+
+CREATE TABLE IF NOT EXISTS transfer_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL DEFAULT 'import',
+  user_id INTEGER,
+  username TEXT NOT NULL DEFAULT '',
+  filename TEXT NOT NULL,
+  file_size INTEGER NOT NULL DEFAULT 0,
+  mime_type TEXT NOT NULL DEFAULT '',
+  file_path TEXT NOT NULL DEFAULT '',
+  remark TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfer_type_created ON transfer_records (type, created_at DESC);
 """
 
 _lock = threading.Lock()
