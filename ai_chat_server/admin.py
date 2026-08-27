@@ -1,11 +1,13 @@
 """管理端 API：概览统计 / 用户管理 / 用量统计 / 模型配置 / 系统设置 / 导入导出记录。"""
 
 import io
+import json
 import os
 
 import openpyxl
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+from openpyxl.worksheet.datavalidation import DataValidation
 
 from .auth import (
     ROLE_SUPER_ADMIN,
@@ -585,6 +587,67 @@ def export_models(admin: dict = Depends(require_model_admin)):
         iter([data]),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _get_provider_ids() -> list[str]:
+    """读取 settings.model_providers 字典，返回 provider id 列表。"""
+    row = fetch_one("SELECT value FROM settings WHERE key = 'model_providers'")
+    if not row or not row["value"]:
+        return []
+    try:
+        parsed = json.loads(row["value"])
+        if isinstance(parsed, list):
+            return [str(p.get("id")) for p in parsed if isinstance(p, dict) and p.get("id")]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return []
+
+
+@router.get("/models/template")
+def download_model_template(admin: dict = Depends(require_model_admin)):
+    """下载模型导入模板：表头 + 示例行 + 枚举列下拉校验（provider / 布尔列）。"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "models"
+    ws.append(_MODEL_FIELDS)
+    # 示例行：与导入解析逻辑对齐（布尔列用「是/否」，_parse_bool 可正确解析）
+    ws.append(["example/model-key", "示例模型名称", "openai", "是", "否", "是", "是", 100, "否"])
+
+    # provider 列（第 3 列 C）下拉：从数据字典取 id
+    provider_ids = _get_provider_ids()
+    if provider_ids:
+        dv_provider = DataValidation(
+            type="list",
+            formula1='"' + ",".join(provider_ids) + '"',
+            allow_blank=True,
+            showDropDown=False,
+        )
+        dv_provider.error = "请从下拉列表选择 provider"
+        dv_provider.errorTitle = "非法值"
+        ws.add_data_validation(dv_provider)
+        dv_provider.add("C2:C1000")
+
+    # 布尔列下拉（是/否）：free(D) / vision(E) / supports_search(F) / enabled(G) / is_default(I)
+    dv_bool = DataValidation(
+        type="list",
+        formula1='"是,否"',
+        allow_blank=True,
+        showDropDown=False,
+    )
+    dv_bool.error = "请选择「是」或「否」"
+    dv_bool.errorTitle = "非法值"
+    ws.add_data_validation(dv_bool)
+    for col in ("D", "E", "F", "G", "I"):
+        dv_bool.add(f"{col}2:{col}1000")
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    data = buf.getvalue()
+    return StreamingResponse(
+        iter([data]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="models_template.xlsx"'},
     )
 
 
