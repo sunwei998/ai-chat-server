@@ -17,6 +17,16 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 _ALG = "HS256"
 
+# ============ 角色常量 ============
+ROLE_SUPER_ADMIN = "super_admin"
+ROLE_SYSTEM_ADMIN = "system_admin"
+ROLE_MODEL_ADMIN = "model_admin"
+ROLE_USER = "user"
+ROLE_SUBSCRIBER = "subscriber"
+
+# 可进入管理控制台的角色
+ADMIN_ROLES = {ROLE_SUPER_ADMIN, ROLE_SYSTEM_ADMIN, ROLE_MODEL_ADMIN}
+
 
 def compute_age(birthday: str | None) -> int | None:
     """由生日(YYYY-MM-DD)推算年龄；缺失或格式非法返回 None。"""
@@ -72,8 +82,30 @@ def get_current_user(request: Request) -> dict:
 
 
 def require_admin(user: dict = Depends(get_current_user)) -> dict:
-    if user["role"] != "admin":
+    """管理控制台通用入口：超级管理员 / 系统管理员 / 模型管理员。"""
+    if user["role"] not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="需要管理员权限")
+    return user
+
+
+def require_super_admin(user: dict = Depends(require_admin)) -> dict:
+    """仅超级管理员：用户管理、角色切换等敏感操作。"""
+    if user["role"] != ROLE_SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="仅超级管理员可执行此操作")
+    return user
+
+
+def require_model_admin(user: dict = Depends(require_admin)) -> dict:
+    """模型管理：超级管理员 / 模型管理员。"""
+    if user["role"] not in (ROLE_SUPER_ADMIN, ROLE_MODEL_ADMIN):
+        raise HTTPException(status_code=403, detail="无模型管理权限")
+    return user
+
+
+def require_settings_admin(user: dict = Depends(require_admin)) -> dict:
+    """系统设置：超级管理员 / 系统管理员。"""
+    if user["role"] not in (ROLE_SUPER_ADMIN, ROLE_SYSTEM_ADMIN):
+        raise HTTPException(status_code=403, detail="无系统设置权限")
     return user
 
 

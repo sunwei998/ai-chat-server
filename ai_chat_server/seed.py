@@ -46,7 +46,7 @@ def seed_admin() -> None:
         print("警告：ADMIN_PASSWORD 未设置，跳过创建管理员")
         return
     execute(
-        "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
+        "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'super_admin', ?)",
         (settings.admin_username, hash_password(settings.admin_password), now_ms()),
     )
     print(f"已创建管理员: {settings.admin_username}")

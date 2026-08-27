@@ -71,7 +71,10 @@ class LoginRequest(BaseModel):
 
 class UserUpdate(BaseModel):
     is_active: bool | None = None
-    role: str | None = Field(default=None, pattern="^(user|admin)$")
+    role: str | None = Field(
+        default=None,
+        pattern="^(super_admin|system_admin|model_admin|user|subscriber)$",
+    )
     province: str | None = Field(default=None, max_length=32)
     city: str | None = Field(default=None, max_length=32)
     district: str | None = Field(default=None, max_length=32)

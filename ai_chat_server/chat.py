@@ -14,7 +14,7 @@ from datetime import datetime
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from .auth import get_current_user
+from .auth import ROLE_USER, get_current_user
 from .config import settings
 from .db import execute, fetch_one, now_ms, transaction
 from .limiter import check_user_limit
@@ -101,6 +101,12 @@ def _get_model(model_key: str) -> dict:
     if not row:
         raise HTTPException(status_code=400, detail=f"模型不可用: {model_key}")
     return dict(row)
+
+
+def _check_model_access(user: dict, model: dict) -> None:
+    """普通用户只能使用免费模型；订阅用户与管理员可用全部模型。"""
+    if user["role"] == ROLE_USER and not model["free"]:
+        raise HTTPException(status_code=403, detail="普通用户无法使用付费模型，请升级订阅")
 
 
 def _endpoint(model: dict) -> str:
@@ -352,6 +358,7 @@ async def chat(
             _persist_user_message(user_id, session_id, last_user, body.user_message_id)
 
     model = _get_model(body.model)
+    _check_model_access(user, model)
     url = _endpoint(model)
     headers = _headers(model)
 

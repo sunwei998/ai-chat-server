@@ -9,18 +9,27 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .admin import router as admin_router
-from .auth import router as auth_router
+from .auth import ROLE_SUPER_ADMIN, router as auth_router
 from .chat import router as chat_router
 from .config import settings
-from .db import init_db
+from .db import execute, init_db
 from .hotwords import router as hotwords_router
 from .models import router as models_router
 from .sessions import router as sessions_router
 
 
+def migrate_roles() -> None:
+    """数据割接：旧角色 admin → super_admin（幂等，可重复执行）。"""
+    execute(
+        "UPDATE users SET role = ? WHERE role = 'admin'",
+        (ROLE_SUPER_ADMIN,),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    migrate_roles()
     yield
 
 

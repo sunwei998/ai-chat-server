@@ -2,7 +2,15 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .auth import compute_age, hash_password, require_admin
+from .auth import (
+    ROLE_SUPER_ADMIN,
+    compute_age,
+    hash_password,
+    require_admin,
+    require_model_admin,
+    require_settings_admin,
+    require_super_admin,
+)
 from .db import execute, fetch_all, fetch_one, now_ms, transaction
 from .schemas import (
     ModelPayload,
@@ -176,6 +184,9 @@ def list_users(
     username: str = "",
     gender: str = "",
     role: str = "",
+    is_active: str = "",
+    sort: str = "",
+    order: str = "desc",
 ):
     offset = (page - 1) * page_size
     clauses: list[str] = []
@@ -196,7 +207,27 @@ def list_users(
         if roles:
             clauses.append("u.role IN (" + ",".join("?" for _ in roles) + ")")
             params.extend(roles)
+    if is_active:
+        clauses.append("u.is_active = ?")
+        params.append(1 if is_active.strip().lower() == "true" else 0)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    # 排序（字段白名单，防 SQL 注入）
+    sort_columns = {
+        "username": "u.username",
+        "role": "u.role",
+        "is_active": "u.is_active",
+        "gender": "u.gender",
+        "birthday": "u.birthday",
+        "created_at": "u.created_at",
+        "updated_at": "u.updated_at",
+        "last_seen_at": "u.last_seen_at",
+        "logins": "logins",
+        "total_tokens": "total_tokens",
+    }
+    order_by = "u.created_at DESC"
+    if sort in sort_columns:
+        direction = "ASC" if order.strip().lower() == "asc" else "DESC"
+        order_by = f"{sort_columns[sort]} {direction}"
     total = fetch_one(f"SELECT COUNT(*) AS n FROM users u {where}", params)["n"]
     rows = fetch_all(
         f"""
@@ -205,7 +236,7 @@ def list_users(
                u.updated_at, u.updated_by,
                COALESCE((SELECT COUNT(*) FROM login_logs l WHERE l.user_id = u.id AND l.success = 1), 0) AS logins,
                COALESCE((SELECT SUM(t.total_tokens) FROM token_usage t WHERE t.user_id = u.id), 0) AS total_tokens
-        FROM users u {where} ORDER BY u.created_at DESC
+        FROM users u {where} ORDER BY {order_by}
         LIMIT ? OFFSET ?
         """,
         (*params, page_size, offset),
@@ -232,7 +263,7 @@ def get_user(user_id: int):
 
 
 @router.patch("/users/{user_id}")
-def update_user(user_id: int, body: UserUpdate, admin: dict = Depends(require_admin)):
+def update_user(user_id: int, body: UserUpdate, admin: dict = Depends(require_super_admin)):
     row = fetch_one("SELECT * FROM users WHERE id = ?", (user_id,))
     if not row:
         raise HTTPException(status_code=404, detail="用户不存在")
@@ -275,7 +306,7 @@ def update_user(user_id: int, body: UserUpdate, admin: dict = Depends(require_ad
 
 
 @router.post("/users/{user_id}/reset-password")
-def reset_password(user_id: int, body: ResetPasswordRequest, admin: dict = Depends(require_admin)):
+def reset_password(user_id: int, body: ResetPasswordRequest, admin: dict = Depends(require_super_admin)):
     row = fetch_one("SELECT id FROM users WHERE id = ?", (user_id,))
     if not row:
         raise HTTPException(status_code=404, detail="用户不存在")
@@ -464,7 +495,7 @@ def get_model(model_id: int):
 
 
 @router.post("/models")
-def create_model(body: ModelPayload):
+def create_model(body: ModelPayload, admin: dict = Depends(require_model_admin)):
     exists = fetch_one("SELECT id FROM models WHERE model_key = ?", (body.model_key,))
     if exists:
         raise HTTPException(status_code=409, detail="model_key 已存在")
@@ -496,7 +527,7 @@ def create_model(body: ModelPayload):
 
 
 @router.put("/models/{model_id}")
-def update_model(model_id: int, body: ModelPayload):
+def update_model(model_id: int, body: ModelPayload, admin: dict = Depends(require_model_admin)):
     row = fetch_one("SELECT id, enabled, is_default FROM models WHERE id = ?", (model_id,))
     if not row:
         raise HTTPException(status_code=404, detail="模型不存在")
@@ -552,7 +583,7 @@ def update_model(model_id: int, body: ModelPayload):
 
 
 @router.delete("/models/{model_id}")
-def delete_model(model_id: int):
+def delete_model(model_id: int, admin: dict = Depends(require_model_admin)):
     execute("DELETE FROM models WHERE id = ?", (model_id,))
     return {"ok": True}
 
@@ -574,7 +605,7 @@ def list_settings(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, l
 
 
 @router.patch("/settings/{key}")
-def update_setting(key: str, body: SettingsPayload):
+def update_setting(key: str, body: SettingsPayload, admin: dict = Depends(require_settings_admin)):
     execute(
         "INSERT OR IGNORE INTO settings (key, value, remark, enabled) VALUES (?, '', '', 1)",
         (key,),
