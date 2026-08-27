@@ -1,9 +1,11 @@
 """管理端 API：概览统计 / 用户管理 / 用量统计 / 模型配置 / 系统设置 / 导入导出记录。"""
 
+import io
 import os
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+import openpyxl
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 
 from .auth import (
     ROLE_SUPER_ADMIN,
@@ -532,6 +534,157 @@ def list_models(
         (*params, page_size, offset),
     )
     return {"items": [dict(r) for r in rows], "total": total, "page": page, "pageSize": page_size}
+
+
+# 模型可导入导出的字段顺序（与 xlsx 表头一致）
+_MODEL_FIELDS = ["model_key", "name", "provider", "free", "vision", "supports_search", "enabled", "sort_order", "is_default"]
+
+
+def _model_rows() -> list[list]:
+    rows = fetch_all("SELECT * FROM models ORDER BY sort_order, id")
+    return [[r[f] if r[f] is not None else "" for f in _MODEL_FIELDS] for r in rows]
+
+
+def _write_transfer_record(type_: str, username: str, filename: str, data: bytes, mime_type: str, remark: str = "") -> str:
+    """把源文件落盘到 transfers 目录，并写入导入/导出记录。返回文件绝对路径。"""
+    os.makedirs(_TRANSFER_DIR, exist_ok=True)
+    ts = now_ms()
+    safe_name = f"{ts}_{filename}"
+    path = os.path.join(_TRANSFER_DIR, safe_name)
+    with open(path, "wb") as f:
+        f.write(data)
+    execute(
+        "INSERT INTO transfer_records (type, username, filename, file_size, mime_type, file_path, remark, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (type_, username, filename, len(data), mime_type, path, remark, ts),
+    )
+    return path
+
+
+@router.get("/models/export")
+def export_models(admin: dict = Depends(require_model_admin)):
+    """导出全部模型为 xlsx（Excel 表格），并写入导出记录。"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "models"
+    ws.append(_MODEL_FIELDS)
+    for row in _model_rows():
+        ws.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    data = buf.getvalue()
+
+    filename = f"models_{now_ms()}.xlsx"
+    username = admin.get("username") or "admin"
+    _write_transfer_record(
+        "export", username, filename, data,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        remark="模型数据导出",
+    )
+    return StreamingResponse(
+        iter([data]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _parse_bool(v) -> int:
+    if isinstance(v, bool):
+        return 1 if v else 0
+    if isinstance(v, (int, float)):
+        return 1 if v else 0
+    s = str(v or "").strip().lower()
+    return 1 if s in ("1", "true", "yes", "是", "y", "on") else 0
+
+
+@router.post("/models/import")
+async def import_models(file: UploadFile = File(...), admin: dict = Depends(require_model_admin)):
+    """从 xlsx（Excel 表格）批量导入模型：model_key 已存在则更新，否则新增。"""
+    raw = await file.read()
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="文件过大（上限 10MB）")
+    original_name = file.filename or "models_import.xlsx"
+    username = admin.get("username") or "admin"
+
+    # 先落盘源文件并写导入记录（无论后续解析是否成功，都保留导入痕迹）
+    saved_path = _write_transfer_record(
+        "import", username, original_name, raw,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        remark="模型数据导入",
+    )
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="无法解析文件，请上传有效的 .xlsx 文件")
+
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        header_row = next(rows_iter)
+    except StopIteration:
+        raise HTTPException(status_code=400, detail="空文件")
+
+    # 表头兼容：去空格、小写
+    header = [str(h).strip().lower() if h is not None else "" for h in header_row]
+    if "model_key" not in header:
+        raise HTTPException(status_code=400, detail="xlsx 缺少 model_key 列")
+    if "name" not in header:
+        raise HTTPException(status_code=400, detail="xlsx 缺少 name 列")
+
+    idx = {h: i for i, h in enumerate(header)}
+    def cell(row, key: str, default=""):
+        i = idx.get(key)
+        if i is None or i >= len(row):
+            return default
+        v = row[i]
+        return "" if v is None else str(v).strip()
+
+    created = 0
+    updated = 0
+    errors: list[str] = []
+    for n, row in enumerate(rows_iter, start=2):
+        if row is None or not any(c is not None and str(c).strip() for c in row):
+            continue
+        model_key = cell(row, "model_key")
+        name = cell(row, "name")
+        if not model_key or not name:
+            errors.append(f"第 {n} 行：model_key/name 不能为空")
+            continue
+        provider = cell(row, "provider", "openai") or "openai"
+        try:
+            sort_order = int(float(cell(row, "sort_order", "0") or "0"))
+        except ValueError:
+            sort_order = 0
+        free = _parse_bool(cell(row, "free", "0"))
+        vision = _parse_bool(cell(row, "vision", "0"))
+        supports_search = _parse_bool(cell(row, "supports_search", "1"))
+        enabled = _parse_bool(cell(row, "enabled", "1"))
+        is_default = _parse_bool(cell(row, "is_default", "0"))
+
+        exists = fetch_one("SELECT id FROM models WHERE model_key = ?", (model_key,))
+        if exists:
+            execute(
+                "UPDATE models SET name=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=?, is_default=? WHERE model_key=?",
+                (name, provider, free, vision, supports_search, enabled, sort_order, is_default, model_key),
+            )
+            updated += 1
+        else:
+            execute(
+                "INSERT INTO models (model_key, name, provider, free, vision, supports_search, enabled, sort_order, is_default, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (model_key, name, provider, free, vision, supports_search, enabled, sort_order, is_default, now_ms()),
+            )
+            created += 1
+
+    # 若导入导致多个默认模型，则收敛为唯一默认（优先 sort_order 最小且 enabled 的）
+    if fetch_one("SELECT COUNT(*) AS n FROM models WHERE is_default = 1")["n"] > 1:
+        execute("UPDATE models SET is_default = 0")
+        d = fetch_one("SELECT id FROM models WHERE enabled = 1 ORDER BY sort_order, id LIMIT 1")
+        if d:
+            execute("UPDATE models SET is_default = 1 WHERE id = ?", (d["id"],))
+
+    return {"ok": True, "created": created, "updated": updated, "errors": errors}
 
 
 @router.get("/models/{model_id}")
