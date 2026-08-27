@@ -471,16 +471,52 @@ def region_stats(period: str = "month"):
 
 
 @router.get("/models")
-def list_models(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100), search: str = ""):
+def list_models(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str = "",
+    enabled: str = "",
+    free: str = "",
+    provider: str = "",
+    sort: str = "",
+    order: str = "asc",
+):
     offset = (page - 1) * page_size
-    where = ""
+    clauses: list[str] = []
     params: list = []
     if search:
-        where = "WHERE model_key LIKE ? OR name LIKE ? OR provider LIKE ?"
+        clauses.append("(model_key LIKE ? OR name LIKE ? OR provider LIKE ?)")
         params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+    if enabled:
+        clauses.append("enabled = ?")
+        params.append(1 if enabled.strip().lower() == "true" else 0)
+    if free:
+        clauses.append("free = ?")
+        params.append(1 if free.strip().lower() == "true" else 0)
+    if provider:
+        providers = [p.strip() for p in provider.split(",") if p.strip()]
+        if providers:
+            clauses.append("provider IN (" + ",".join("?" for _ in providers) + ")")
+            params.extend(providers)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    # 排序（字段白名单，防注入）
+    sort_columns = {
+        "model_key": "model_key",
+        "name": "name",
+        "provider": "provider",
+        "sort_order": "sort_order",
+        "free": "free",
+        "enabled": "enabled",
+        "vision": "vision",
+        "supports_search": "supports_search",
+    }
+    order_by = "sort_order, id"
+    if sort in sort_columns:
+        direction = "ASC" if order.strip().lower() == "asc" else "DESC"
+        order_by = f"{sort_columns[sort]} {direction}, id"
     total = fetch_one(f"SELECT COUNT(*) AS n FROM models {where}", params)["n"]
     rows = fetch_all(
-        f"SELECT * FROM models {where} ORDER BY sort_order, id LIMIT ? OFFSET ?",
+        f"SELECT * FROM models {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
         (*params, page_size, offset),
     )
     return {"items": [dict(r) for r in rows], "total": total, "page": page, "pageSize": page_size}
@@ -589,16 +625,32 @@ def delete_model(model_id: int, admin: dict = Depends(require_model_admin)):
 
 
 @router.get("/settings")
-def list_settings(page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=100), search: str = ""):
+def list_settings(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str = "",
+    enabled: str = "",
+    sort: str = "",
+    order: str = "asc",
+):
     offset = (page - 1) * page_size
-    where = ""
+    clauses: list[str] = []
     params: list = []
     if search:
-        where = "WHERE key LIKE ? OR value LIKE ? OR remark LIKE ?"
+        clauses.append("(key LIKE ? OR value LIKE ? OR remark LIKE ?)")
         params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+    if enabled:
+        clauses.append("enabled = ?")
+        params.append(1 if enabled.strip().lower() == "true" else 0)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sort_columns = {"key": "key", "value": "value", "remark": "remark", "enabled": "enabled"}
+    order_by = "key"
+    if sort in sort_columns:
+        direction = "ASC" if order.strip().lower() == "asc" else "DESC"
+        order_by = f"{sort_columns[sort]} {direction}"
     total = fetch_one(f"SELECT COUNT(*) AS n FROM settings {where}", params)["n"]
     rows = fetch_all(
-        f"SELECT * FROM settings {where} ORDER BY key LIMIT ? OFFSET ?",
+        f"SELECT * FROM settings {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
         (*params, page_size, offset),
     )
     return {"items": [dict(r) for r in rows], "total": total, "page": page, "pageSize": page_size}
