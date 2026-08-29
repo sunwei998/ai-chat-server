@@ -94,12 +94,19 @@ def _persist_assistant(
     transaction(queries)
 
 
-def _get_model(model_key: str) -> dict:
-    row = fetch_one(
-        "SELECT * FROM models WHERE model_key = ? AND enabled = 1", (model_key,)
-    )
+def _get_model(model_ref: str) -> dict:
+    """优先按数字 id 解析（model_key 仅 provider 级唯一后，id 才是稳定引用）；
+    非数字回退 model_key，兼容旧会话与前端降级字典。"""
+    row = None
+    if str(model_ref).isdigit():
+        row = fetch_one("SELECT * FROM models WHERE id = ? AND enabled = 1", (int(model_ref),))
+    if row is None:
+        row = fetch_one(
+            "SELECT * FROM models WHERE model_key = ? AND enabled = 1 ORDER BY sort_order, id LIMIT 1",
+            (model_ref,),
+        )
     if not row:
-        raise HTTPException(status_code=400, detail=f"模型不可用: {model_key}")
+        raise HTTPException(status_code=400, detail=f"模型不可用: {model_ref}")
     return dict(row)
 
 
@@ -188,15 +195,16 @@ def _extract_usage(line: str) -> dict | None:
     return None
 
 
-def _record_usage(user_id: int, model_key: str, usage: dict | None) -> None:
+def _record_usage(user_id: int, model: dict, usage: dict | None) -> None:
     if not usage:
         return
     execute(
-        "INSERT INTO token_usage (user_id, model_key, prompt_tokens, completion_tokens, total_tokens, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO token_usage (user_id, model_key, model_id, prompt_tokens, completion_tokens, total_tokens, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             user_id,
-            model_key,
+            model["model_key"],
+            model["id"],
             usage["prompt_tokens"],
             usage["completion_tokens"],
             usage["total_tokens"],
@@ -423,7 +431,7 @@ async def chat(
             logger.warning("chat 流异常: %s", exc)
             yield error_event(f"服务异常: {exc}")
         finally:
-            _record_usage(user_id, model["model_key"], usage_holder or None)
+            _record_usage(user_id, model, usage_holder or None)
             if user_id:
                 execute(
                     "UPDATE users SET last_seen_at = ? WHERE id = ?",

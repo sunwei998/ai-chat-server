@@ -3,10 +3,13 @@
 import io
 import json
 import os
+import re
 
 import openpyxl
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+from openpyxl.styles import Font, PatternFill
+from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from .auth import (
@@ -19,7 +22,7 @@ from .auth import (
     require_super_admin,
 )
 from .config import settings
-from .db import execute, fetch_all, fetch_one, now_ms, transaction
+from .db import DEFAULT_MODEL_PROVIDERS, execute, fetch_all, fetch_one, now_ms, transaction
 from .schemas import (
     DimTableCreate,
     DimTableOut,
@@ -30,6 +33,7 @@ from .schemas import (
     DimValueUpdate,
     ModelPayload,
     ResetPasswordRequest,
+    SettingLogList,
     SettingsPayload,
     UserUpdate,
 )
@@ -128,10 +132,36 @@ def overview():
 
     by_model = fetch_all(
         """
-        SELECT model_key, COUNT(*) AS requests,
-               COALESCE(SUM(total_tokens), 0) AS total
-        FROM token_usage WHERE created_at >= ?
-        GROUP BY model_key ORDER BY total DESC LIMIT 8
+        SELECT t.model_key AS model_key,
+               COALESCE(m.name, t.model_key) AS name,
+               COALESCE(m.name_en, '') AS name_en,
+               COALESCE(m.provider, '') AS provider,
+               COUNT(*) AS requests,
+               COALESCE(SUM(t.total_tokens), 0) AS total
+        FROM token_usage t LEFT JOIN models m ON m.id = COALESCE(t.model_id,
+             (SELECT m2.id FROM models m2 WHERE m2.model_key = t.model_key
+              ORDER BY m2.sort_order, m2.id LIMIT 1))
+        WHERE t.created_at >= ?
+        GROUP BY COALESCE(t.model_id,
+             (SELECT m3.id FROM models m3 WHERE m3.model_key = t.model_key
+              ORDER BY m3.sort_order, m3.id LIMIT 1),
+             'key:' || t.model_key)
+        ORDER BY total DESC LIMIT 8
+        """,
+        (start30,),
+    )
+
+    by_provider = fetch_all(
+        """
+        SELECT COALESCE(m.provider, '') AS provider,
+               COUNT(*) AS requests,
+               COALESCE(SUM(t.total_tokens), 0) AS total
+        FROM token_usage t LEFT JOIN models m ON m.id = COALESCE(t.model_id,
+             (SELECT m2.id FROM models m2 WHERE m2.model_key = t.model_key
+              ORDER BY m2.sort_order, m2.id LIMIT 1))
+        WHERE t.created_at >= ? AND COALESCE(m.provider, '') != ''
+        GROUP BY COALESCE(m.provider, '')
+        ORDER BY total DESC
         """,
         (start30,),
     )
@@ -183,6 +213,7 @@ def overview():
         "hourly": [dict(r) for r in hourly],
         "new_users": [dict(r) for r in new_users],
         "by_model": [dict(r) for r in by_model],
+        "by_provider": [dict(r) for r in by_provider],
         "top_users": [dict(r) for r in top_users],
         "top_provinces": [dict(r) for r in top_provinces],
         "recent_users": [dict(r) for r in recent_users],
@@ -347,11 +378,22 @@ def usage():
     )
     by_model = fetch_all(
         """
-        SELECT model_key, COUNT(*) AS requests,
-               COALESCE(SUM(prompt_tokens), 0) AS prompt,
-               COALESCE(SUM(completion_tokens), 0) AS completion,
-               COALESCE(SUM(total_tokens), 0) AS total
-        FROM token_usage GROUP BY model_key ORDER BY total DESC
+        SELECT t.model_key AS model_key,
+               COALESCE(m.name, t.model_key) AS name,
+               COALESCE(m.name_en, '') AS name_en,
+               COALESCE(m.provider, '') AS provider,
+               COUNT(*) AS requests,
+               COALESCE(SUM(t.prompt_tokens), 0) AS prompt,
+               COALESCE(SUM(t.completion_tokens), 0) AS completion,
+               COALESCE(SUM(t.total_tokens), 0) AS total
+        FROM token_usage t LEFT JOIN models m ON m.id = COALESCE(t.model_id,
+             (SELECT m2.id FROM models m2 WHERE m2.model_key = t.model_key
+              ORDER BY m2.sort_order, m2.id LIMIT 1))
+        GROUP BY COALESCE(t.model_id,
+             (SELECT m3.id FROM models m3 WHERE m3.model_key = t.model_key
+              ORDER BY m3.sort_order, m3.id LIMIT 1),
+             'key:' || t.model_key)
+        ORDER BY total DESC
         """
     )
     daily = fetch_all(
@@ -362,10 +404,36 @@ def usage():
         """,
         (now - 30 * _DAY_MS,),
     )
+    by_provider = fetch_all(
+        """
+        SELECT COALESCE(m.provider, '') AS provider,
+               COUNT(*) AS requests,
+               COALESCE(SUM(t.total_tokens), 0) AS total
+        FROM token_usage t LEFT JOIN models m ON m.id = COALESCE(t.model_id,
+             (SELECT m2.id FROM models m2 WHERE m2.model_key = t.model_key
+              ORDER BY m2.sort_order, m2.id LIMIT 1))
+        WHERE COALESCE(m.provider, '') != ''
+        GROUP BY COALESCE(m.provider, '')
+        ORDER BY total DESC
+        """
+    )
+    by_city = fetch_all(
+        """
+        SELECT u.province AS province, u.city AS city,
+               COUNT(t.id) AS requests,
+               COALESCE(SUM(t.total_tokens), 0) AS total
+        FROM users u JOIN token_usage t ON t.user_id = u.id
+        WHERE u.city != ''
+        GROUP BY u.province, u.city
+        ORDER BY total DESC LIMIT 60
+        """
+    )
     age_dist, gender_dist = _aggregate_demographics()
     return {
         "by_user": [dict(r) for r in by_user],
         "by_model": [dict(r) for r in by_model],
+        "by_provider": [dict(r) for r in by_provider],
+        "by_city": [dict(r) for r in by_city],
         "daily": [dict(r) for r in daily],
         "age_dist": age_dist,
         "gender_dist": gender_dist,
@@ -546,7 +614,7 @@ def list_models(
 
 
 # 模型可导入导出的字段顺序（与 xlsx 表头一致）
-_MODEL_FIELDS = ["model_key", "name", "provider", "free", "vision", "supports_search", "enabled", "sort_order", "is_default"]
+_MODEL_FIELDS = ["model_key", "name", "name_en", "provider", "free", "vision", "supports_search", "enabled", "sort_order", "is_default"]
 
 
 def _model_rows() -> list[list]:
@@ -554,45 +622,87 @@ def _model_rows() -> list[list]:
     return [[r[f] if r[f] is not None else "" for f in _MODEL_FIELDS] for r in rows]
 
 
-def _write_transfer_record(type_: str, username: str, filename: str, data: bytes, mime_type: str, remark: str = "") -> str:
-    """把源文件落盘到 transfers 目录，并写入导入/导出记录。返回文件绝对路径。"""
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _write_transfer_record(
+    type_: str, username: str, filename: str, data: bytes, mime_type: str,
+    remark: str = "", status: str = "success",
+) -> tuple[str, int]:
+    """把源文件落盘到 transfers 目录，并写入导入/导出记录。返回 (文件绝对路径, 记录 id)。"""
     os.makedirs(_TRANSFER_DIR, exist_ok=True)
     ts = now_ms()
     safe_name = f"{ts}_{filename}"
     path = os.path.join(_TRANSFER_DIR, safe_name)
     with open(path, "wb") as f:
         f.write(data)
-    execute(
-        "INSERT INTO transfer_records (type, username, filename, file_size, mime_type, file_path, remark, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (type_, username, filename, len(data), mime_type, path, remark, ts),
+    record_id = execute(
+        "INSERT INTO transfer_records (type, username, filename, file_size, mime_type, file_path, remark, status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (type_, username, filename, len(data), mime_type, path, remark, status, ts),
     )
-    return path
+    return path, record_id
+
+
+def _write_transfer_meta(
+    type_: str, username: str, filename: str, size: int, mime_type: str,
+    remark: str = "", status: str = "success",
+) -> int:
+    """仅写入导入/导出行为记录，不落盘文件（导出不存产物场景）。记录页可据此重新生成下载。"""
+    return execute(
+        "INSERT INTO transfer_records (type, username, filename, file_size, mime_type, file_path, remark, status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)",
+        (type_, username, filename, size, mime_type, remark, status, now_ms()),
+    )
+
+
+def _build_annotated_file(raw: bytes, row_errors: dict, filename: str) -> tuple[str, int]:
+    """基于导入源文件生成带「错误分析」列的 xlsx：表头红底白字，错误行单元格黄底。返回 (path, size)。"""
+    wb = openpyxl.load_workbook(io.BytesIO(raw))
+    ws = wb.active
+    err_col = ws.max_column + 1
+    header_cell = ws.cell(row=1, column=err_col, value="错误分析")
+    header_cell.fill = PatternFill(fill_type="solid", start_color="C00000", end_color="C00000")
+    header_cell.font = Font(color="FFFFFF", bold=True)
+    yellow = PatternFill(fill_type="solid", start_color="FFEB9C", end_color="FFEB9C")
+    for row_no, reason in sorted(row_errors.items()):
+        cell = ws.cell(row=row_no, column=err_col, value=reason)
+        cell.fill = yellow
+    os.makedirs(_TRANSFER_DIR, exist_ok=True)
+    path = os.path.join(_TRANSFER_DIR, f"{now_ms()}_annotated_{filename}")
+    wb.save(path)
+    return path, os.path.getsize(path)
 
 
 @router.get("/models/export")
 def export_models(admin: dict = Depends(require_model_admin)):
-    """导出全部模型为 xlsx（Excel 表格），并写入导出记录。"""
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "models"
-    ws.append(_MODEL_FIELDS)
-    for row in _model_rows():
-        ws.append(row)
-    buf = io.BytesIO()
-    wb.save(buf)
-    data = buf.getvalue()
+    """导出全部模型为 xlsx（Excel 表格）。导出不存产物：仅写行为记录，记录页可重新生成下载。"""
+    username = admin.get("username") or "admin"
+    try:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "models"
+        ws.append(_MODEL_FIELDS)
+        for row in _model_rows():
+            ws.append(row)
+        buf = io.BytesIO()
+        wb.save(buf)
+        data = buf.getvalue()
+    except Exception as err:
+        _write_transfer_meta(
+            "export", username, f"models_{now_ms()}.xlsx", 0, _XLSX_MIME,
+            remark=f"模型数据导出失败：{err}", status="failed",
+        )
+        raise
 
     filename = f"models_{now_ms()}.xlsx"
-    username = admin.get("username") or "admin"
-    _write_transfer_record(
-        "export", username, filename, data,
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        remark="模型数据导出",
+    _write_transfer_meta(
+        "export", username, filename, len(data), _XLSX_MIME,
+        remark="模型数据导出", status="success",
     )
     return StreamingResponse(
         iter([data]),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=_XLSX_MIME,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -609,41 +719,63 @@ def _get_provider_ids() -> list[str]:
     return [r["code"] for r in rows]
 
 
+def _known_provider_ids() -> list[str]:
+    """provider 合法取值：维表优先，维表未配置时回退本地默认字典。"""
+    return _get_provider_ids() or [code for code, _, _ in DEFAULT_MODEL_PROVIDERS]
+
+
 @router.get("/models/template")
-def download_model_template(admin: dict = Depends(require_model_admin)):
-    """下载模型导入模板：表头 + 示例行 + 枚举列下拉校验（provider / 布尔列）。"""
+def download_model_template(request: Request, admin: dict = Depends(require_model_admin)):
+    """下载模型导入模板：表头 + 示例行 + 枚举列下拉校验（provider / 布尔列）。
+    按 Accept-Language 本地化：英文状态下载英文模板（示例值与校验文案）。"""
+    is_en = "en" in (request.headers.get("accept-language") or "").lower()
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "models"
     ws.append(_MODEL_FIELDS)
-    # 示例行：与导入解析逻辑对齐（布尔列用「是/否」，_parse_bool 可正确解析）
-    ws.append(["example/model-key", "示例模型名称", "openai", "是", "否", "是", "是", 100, "否"])
+    # 示例行：与导入解析逻辑对齐（布尔列「是/否」或 yes/no，_parse_bool 均可解析）
+    if is_en:
+        ws.append(["example/model-key", "Model Name (Chinese)", "Example Model Name", "openai", "yes", "no", "yes", "yes", 100, "no"])
+        prov_err, prov_err_title = "Please select a provider from the dropdown", "Invalid value"
+        bool_list, bool_err, bool_err_title = '"yes,no"', 'Please choose "yes" or "no"', "Invalid value"
+    else:
+        ws.append(["example/model-key", "示例模型名称", "Example Model Name", "openai", "是", "否", "是", "是", 100, "否"])
+        prov_err, prov_err_title = "请从下拉列表选择 provider", "非法值"
+        bool_list, bool_err, bool_err_title = '"是,否"', "请选择「是」或「否」", "非法值"
 
-    # provider 列（第 3 列 C）下拉：从数据字典取 id
-    provider_ids = _get_provider_ids()
+    # provider 列（第 4 列 D）下拉：实时读取数据字典，写入隐藏 dict 表 + 命名范围
+    # （维表变动后下次下载即生效；命名范围不受 Excel 字面量列表 255 字符限制）
+    provider_ids = _get_provider_ids() or [code for code, _, _ in DEFAULT_MODEL_PROVIDERS]
     if provider_ids:
+        dict_ws = wb.create_sheet("dict")
+        for i, pid in enumerate(provider_ids, start=1):
+            dict_ws.cell(row=i, column=1, value=pid)
+        dict_ws.sheet_state = "hidden"
+        wb.defined_names["ProviderList"] = DefinedName(
+            "ProviderList", attr_text=f"'dict'!$A$1:$A${len(provider_ids)}"
+        )
         dv_provider = DataValidation(
             type="list",
-            formula1='"' + ",".join(provider_ids) + '"',
+            formula1="=ProviderList",
             allow_blank=True,
             showDropDown=False,
         )
-        dv_provider.error = "请从下拉列表选择 provider"
-        dv_provider.errorTitle = "非法值"
+        dv_provider.error = prov_err
+        dv_provider.errorTitle = prov_err_title
         ws.add_data_validation(dv_provider)
-        dv_provider.add("C2:C1000")
+        dv_provider.add("D2:D1000")
 
-    # 布尔列下拉（是/否）：free(D) / vision(E) / supports_search(F) / enabled(G) / is_default(I)
+    # 布尔列下拉：free(E) / vision(F) / supports_search(G) / enabled(H) / is_default(J)
     dv_bool = DataValidation(
         type="list",
-        formula1='"是,否"',
+        formula1=bool_list,
         allow_blank=True,
         showDropDown=False,
     )
-    dv_bool.error = "请选择「是」或「否」"
-    dv_bool.errorTitle = "非法值"
+    dv_bool.error = bool_err
+    dv_bool.errorTitle = bool_err_title
     ws.add_data_validation(dv_bool)
-    for col in ("D", "E", "F", "G", "I"):
+    for col in ("E", "F", "G", "H", "J"):
         dv_bool.add(f"{col}2:{col}1000")
 
     buf = io.BytesIO()
@@ -665,25 +797,41 @@ def _parse_bool(v) -> int:
     return 1 if s in ("1", "true", "yes", "是", "y", "on") else 0
 
 
+def _has_chinese(s: str) -> bool:
+    """是否含中文字符（CJK 统一表意文字基本区 + 扩展 A）。"""
+    return any("一" <= c <= "鿿" or "㐀" <= c <= "䶿" for c in s)
+
+
 @router.post("/models/import")
 async def import_models(file: UploadFile = File(...), admin: dict = Depends(require_model_admin)):
     """从 xlsx（Excel 表格）批量导入模型：model_key 已存在则更新，否则新增。"""
     raw = await file.read()
-    if len(raw) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="文件过大（上限 10MB）")
     original_name = file.filename or "models_import.xlsx"
     username = admin.get("username") or "admin"
+    if len(raw) > 10 * 1024 * 1024:
+        # 超大文件不落盘，但同样写失败记录，同步到导入管理
+        _write_transfer_meta(
+            "import", username, original_name, len(raw), _XLSX_MIME,
+            remark="模型数据导入：文件过大（上限 10MB）", status="failed",
+        )
+        raise HTTPException(status_code=400, detail="文件过大（上限 10MB）")
 
     # 先落盘源文件并写导入记录（无论后续解析是否成功，都保留导入痕迹）
-    saved_path = _write_transfer_record(
-        "import", username, original_name, raw,
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        remark="模型数据导入",
+    saved_path, record_id = _write_transfer_record(
+        "import", username, original_name, raw, _XLSX_MIME,
+        remark="模型数据导入", status="",
     )
+
+    def _mark_failed(reason: str) -> None:
+        execute(
+            "UPDATE transfer_records SET status='failed', remark=? WHERE id=?",
+            (f"模型数据导入：{reason}", record_id),
+        )
 
     try:
         wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
     except Exception:
+        _mark_failed("无法解析文件")
         raise HTTPException(status_code=400, detail="无法解析文件，请上传有效的 .xlsx 文件")
 
     ws = wb.active
@@ -691,13 +839,16 @@ async def import_models(file: UploadFile = File(...), admin: dict = Depends(requ
     try:
         header_row = next(rows_iter)
     except StopIteration:
+        _mark_failed("空文件")
         raise HTTPException(status_code=400, detail="空文件")
 
     # 表头兼容：去空格、小写
     header = [str(h).strip().lower() if h is not None else "" for h in header_row]
     if "model_key" not in header:
+        _mark_failed("缺少 model_key 列")
         raise HTTPException(status_code=400, detail="xlsx 缺少 model_key 列")
     if "name" not in header:
+        _mark_failed("缺少 name 列")
         raise HTTPException(status_code=400, detail="xlsx 缺少 name 列")
 
     idx = {h: i for i, h in enumerate(header)}
@@ -711,15 +862,54 @@ async def import_models(file: UploadFile = File(...), admin: dict = Depends(requ
     created = 0
     updated = 0
     errors: list[str] = []
+    row_errors: dict[int, str] = {}
+    known_providers = set(_known_provider_ids())
+    seen_names: set[str] = set()
+    seen_names_en: set[str] = set()
     for n, row in enumerate(rows_iter, start=2):
         if row is None or not any(c is not None and str(c).strip() for c in row):
             continue
         model_key = cell(row, "model_key")
         name = cell(row, "name")
         if not model_key or not name:
-            errors.append(f"第 {n} 行：model_key/name 不能为空")
+            reason = "model_key/name 不能为空"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+        name_en = cell(row, "name_en")
+        if len(name_en) > 100:
+            reason = "name_en 长度超限（100）"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+        if name_en and _has_chinese(name_en):
+            reason = "name_en 不能包含中文"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
             continue
         provider = cell(row, "provider", "openai") or "openai"
+        if provider not in known_providers:
+            reason = "provider 不在数据字典"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+        exists = fetch_one(
+            "SELECT id FROM models WHERE provider = ? AND model_key = ?", (provider, model_key)
+        )
+        dup_name = fetch_one("SELECT id FROM models WHERE name = ?", (name,))
+        if (dup_name and (not exists or dup_name["id"] != exists["id"])) or name in seen_names:
+            reason = "模型名称已存在"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+        dup_name_en = None
+        if name_en:
+            dup_name_en = fetch_one("SELECT id FROM models WHERE name_en = ? AND name_en <> ''", (name_en,))
+        if (dup_name_en and (not exists or dup_name_en["id"] != exists["id"])) or name_en in seen_names_en:
+            reason = "英文名称已存在"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
         try:
             sort_order = int(float(cell(row, "sort_order", "0") or "0"))
         except ValueError:
@@ -730,20 +920,22 @@ async def import_models(file: UploadFile = File(...), admin: dict = Depends(requ
         enabled = _parse_bool(cell(row, "enabled", "1"))
         is_default = _parse_bool(cell(row, "is_default", "0"))
 
-        exists = fetch_one("SELECT id FROM models WHERE model_key = ?", (model_key,))
         if exists:
             execute(
-                "UPDATE models SET name=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=?, is_default=? WHERE model_key=?",
-                (name, provider, free, vision, supports_search, enabled, sort_order, is_default, model_key),
+                "UPDATE models SET name=?, name_en=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=?, is_default=? WHERE model_key=? AND provider=?",
+                (name, name_en, provider, free, vision, supports_search, enabled, sort_order, is_default, model_key, provider),
             )
             updated += 1
         else:
             execute(
-                "INSERT INTO models (model_key, name, provider, free, vision, supports_search, enabled, sort_order, is_default, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (model_key, name, provider, free, vision, supports_search, enabled, sort_order, is_default, now_ms()),
+                "INSERT INTO models (model_key, name, name_en, provider, free, vision, supports_search, enabled, sort_order, is_default, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (model_key, name, name_en, provider, free, vision, supports_search, enabled, sort_order, is_default, now_ms()),
             )
             created += 1
+        seen_names.add(name)
+        if name_en:
+            seen_names_en.add(name_en)
 
     # 若导入导致多个默认模型，则收敛为唯一默认（优先 sort_order 最小且 enabled 的）
     if fetch_one("SELECT COUNT(*) AS n FROM models WHERE is_default = 1")["n"] > 1:
@@ -752,7 +944,57 @@ async def import_models(file: UploadFile = File(...), admin: dict = Depends(requ
         if d:
             execute("UPDATE models SET is_default = 1 WHERE id = ?", (d["id"],))
 
+    # 记录状态：全部失败 → failed；有行错误但有成功 → partial；否则 success
+    if row_errors and (created + updated) == 0:
+        status = "failed"
+    elif row_errors:
+        status = "partial"
+    else:
+        status = "success"
+
+    # 失败/部分成功：下载产物替换为带「错误分析」列的标注文件（含全部源数据，是源文件的超集）
+    if row_errors:
+        try:
+            ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name)
+            if os.path.isfile(saved_path):
+                os.remove(saved_path)
+            execute(
+                "UPDATE transfer_records SET file_path=?, file_size=? WHERE id=?",
+                (ann_path, ann_size, record_id),
+            )
+        except Exception:
+            pass  # 标注失败保留源文件，不影响导入主流程
+
+    execute("UPDATE transfer_records SET status=? WHERE id=?", (status, record_id))
+
     return {"ok": True, "created": created, "updated": updated, "errors": errors}
+
+
+@router.get("/models/check")
+def check_model_uniqueness(
+    model_key: str = "",
+    name: str = "",
+    name_en: str = "",
+    provider: str = "",
+    exclude_id: int = 0,
+    admin: dict = Depends(require_admin),
+):
+    """失焦轻量查重：model_key 同供应商内唯一；name / name_en 全局唯一。exclude_id 用于编辑时排除自身。"""
+    key_exists = False
+    name_exists = False
+    if model_key and provider:
+        r = fetch_one(
+            "SELECT id FROM models WHERE provider = ? AND model_key = ?", (provider, model_key)
+        )
+        key_exists = bool(r and r["id"] != exclude_id)
+    if name:
+        r = fetch_one("SELECT id FROM models WHERE name = ?", (name,))
+        name_exists = bool(r and r["id"] != exclude_id)
+    name_en_exists = False
+    if name_en:
+        r = fetch_one("SELECT id FROM models WHERE name_en = ? AND name_en <> ''", (name_en,))
+        name_en_exists = bool(r and r["id"] != exclude_id)
+    return {"model_key_exists": key_exists, "name_exists": name_exists, "name_en_exists": name_en_exists}
 
 
 @router.get("/models/{model_id}")
@@ -765,17 +1007,30 @@ def get_model(model_id: int):
 
 @router.post("/models")
 def create_model(body: ModelPayload, admin: dict = Depends(require_model_admin)):
-    exists = fetch_one("SELECT id FROM models WHERE model_key = ?", (body.model_key,))
+    exists = fetch_one(
+        "SELECT id FROM models WHERE provider = ? AND model_key = ?",
+        (body.provider, body.model_key),
+    )
     if exists:
-        raise HTTPException(status_code=409, detail="model_key 已存在")
+        raise HTTPException(status_code=409, detail="同供应商下 model_key 已存在")
+    if body.provider not in set(_known_provider_ids()):
+        raise HTTPException(status_code=400, detail="provider 不在数据字典")
+    dup_name = fetch_one("SELECT id FROM models WHERE name = ?", (body.name,))
+    if dup_name:
+        raise HTTPException(status_code=409, detail="模型名称已存在")
+    if body.name_en:
+        dup_name_en = fetch_one("SELECT id FROM models WHERE name_en = ? AND name_en <> ''", (body.name_en,))
+        if dup_name_en:
+            raise HTTPException(status_code=409, detail="英文名称已存在")
     if body.is_default and not body.enabled:
         raise HTTPException(status_code=400, detail="禁用模型不能设为默认模型")
     new_id = execute(
-        "INSERT INTO models (model_key, name, provider, free, vision, supports_search, enabled, sort_order, is_default, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO models (model_key, name, name_en, provider, free, vision, supports_search, enabled, sort_order, is_default, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             body.model_key,
             body.name,
+            body.name_en,
             body.provider,
             1 if body.free else 0,
             1 if body.vision else 0,
@@ -801,6 +1056,22 @@ def update_model(model_id: int, body: ModelPayload, admin: dict = Depends(requir
     if not row:
         raise HTTPException(status_code=404, detail="模型不存在")
 
+    if body.provider not in set(_known_provider_ids()):
+        raise HTTPException(status_code=400, detail="provider 不在数据字典")
+    key_dup = fetch_one(
+        "SELECT id FROM models WHERE provider = ? AND model_key = ?",
+        (body.provider, body.model_key),
+    )
+    if key_dup and key_dup["id"] != model_id:
+        raise HTTPException(status_code=409, detail="同供应商下 model_key 已存在")
+    dup_name = fetch_one("SELECT id FROM models WHERE name = ?", (body.name,))
+    if dup_name and dup_name["id"] != model_id:
+        raise HTTPException(status_code=409, detail="模型名称已存在")
+    if body.name_en:
+        dup_name_en = fetch_one("SELECT id FROM models WHERE name_en = ? AND name_en <> ''", (body.name_en,))
+        if dup_name_en and dup_name_en["id"] != model_id:
+            raise HTTPException(status_code=409, detail="英文名称已存在")
+
     effective_enabled = body.enabled if body.enabled is not None else bool(row["enabled"])
 
     if not body.is_default:
@@ -811,10 +1082,11 @@ def update_model(model_id: int, body: ModelPayload, admin: dict = Depends(requir
             raise HTTPException(status_code=400, detail="必须保留一个默认模型，请先指定其它默认模型")
         # 普通更新，不动 is_default
         execute(
-            "UPDATE models SET model_key=?, name=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=? WHERE id=?",
+            "UPDATE models SET model_key=?, name=?, name_en=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=? WHERE id=?",
             (
                 body.model_key,
                 body.name,
+                body.name_en,
                 body.provider,
                 1 if body.free else 0,
                 1 if body.vision else 0,
@@ -833,6 +1105,7 @@ def update_model(model_id: int, body: ModelPayload, admin: dict = Depends(requir
     params = (
         body.model_key,
         body.name,
+        body.name_en,
         body.provider,
         1 if body.free else 0,
         1 if body.vision else 0,
@@ -844,7 +1117,7 @@ def update_model(model_id: int, body: ModelPayload, admin: dict = Depends(requir
     transaction([
         ("UPDATE models SET is_default = 0 WHERE id <> ?", (model_id,)),
         (
-            "UPDATE models SET model_key=?, name=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=?, is_default=1 WHERE id=?",
+            "UPDATE models SET model_key=?, name=?, name_en=?, provider=?, free=?, vision=?, supports_search=?, enabled=?, sort_order=?, is_default=1 WHERE id=?",
             params,
         ),
     ])
@@ -891,25 +1164,119 @@ def list_settings(
 
 @router.patch("/settings/{key}")
 def update_setting(key: str, body: SettingsPayload, admin: dict = Depends(require_settings_admin)):
-    execute(
-        "INSERT OR IGNORE INTO settings (key, value, remark, enabled) VALUES (?, '', '', 1)",
-        (key,),
-    )
+    key = _validate_setting_key(key)
+    row = fetch_one("SELECT * FROM settings WHERE key = ?", (key,))
+    if row is None:
+        # 不存在视为新增（INSERT OR IGNORE 兼容已存在的情况）
+        execute(
+            "INSERT OR IGNORE INTO settings (key, value, remark, enabled) VALUES (?, '', '', 1)",
+            (key,),
+        )
+        old = {"value": "", "remark": "", "enabled": 1}
+        _log_setting(key, admin, f"新增配置项「{key}」", f'Created setting "{key}"')
+    else:
+        old = dict(row)
     updates: list[str] = []
     params: list = []
+    log_msgs: list[tuple[str, str]] = []  # (中文, English)
     if body.value is not None:
         updates.append("value = ?")
         params.append(body.value)
+        if old["value"] != body.value:
+            log_msgs.append(
+                (
+                    f'配置值从「{old["value"]}」改成「{body.value}」',
+                    f'Value changed from "{old["value"]}" to "{body.value}"',
+                )
+            )
     if body.remark is not None:
         updates.append("remark = ?")
         params.append(body.remark)
+        if old["remark"] != body.remark:
+            log_msgs.append(
+                (
+                    f'备注从「{old["remark"]}」改成「{body.remark}」',
+                    f'Remark changed from "{old["remark"]}" to "{body.remark}"',
+                )
+            )
     if body.enabled is not None:
         updates.append("enabled = ?")
         params.append(1 if body.enabled else 0)
+        old_enabled = bool(old["enabled"])
+        if old_enabled != body.enabled:
+            old_txt = "开启" if old_enabled else "禁用"
+            new_txt = "开启" if body.enabled else "禁用"
+            old_en = "enabled" if old_enabled else "disabled"
+            new_en = "enabled" if body.enabled else "disabled"
+            log_msgs.append(
+                (f"状态从「{old_txt}」改成「{new_txt}」", f'Status changed from "{old_en}" to "{new_en}"')
+            )
     if updates:
         params.append(key)
         execute(f"UPDATE settings SET {', '.join(updates)} WHERE key = ?", params)
+    for zh, en in log_msgs:
+        _log_setting(key, admin, zh, en)
     return {"ok": True}
+
+
+@router.delete("/settings/{key}")
+def delete_setting(key: str, admin: dict = Depends(require_settings_admin)):
+    key = _validate_setting_key(key)
+    row = fetch_one("SELECT * FROM settings WHERE key = ?", (key,))
+    if row is None:
+        raise HTTPException(status_code=404, detail="配置项不存在")
+    if row["enabled"]:
+        raise HTTPException(status_code=400, detail="启用状态的配置项不能删除，请先禁用")
+    execute("DELETE FROM settings WHERE key = ?", (key,))
+    _log_setting(key, admin, f"删除配置项「{key}」", f'Deleted setting "{key}"')
+    return {"ok": True}
+
+
+@router.get("/settings/{key}/logs", response_model=SettingLogList)
+def list_setting_logs(
+    key: str,
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    admin: dict = Depends(require_settings_admin),
+):
+    offset = (page - 1) * page_size
+    is_en = "en" in (request.headers.get("accept-language") or "").lower()
+    total = fetch_one(
+        "SELECT COUNT(*) AS n FROM setting_logs WHERE setting_key = ?", (key,)
+    )["n"]
+    rows = fetch_all(
+        "SELECT * FROM setting_logs WHERE setting_key = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        (key, page_size, offset),
+    )
+    items = []
+    for r in rows:
+        d = dict(r)
+        if is_en:
+            d["content"] = d.get("content_en") or d["content"]
+        items.append(d)
+    return {"items": items, "total": total, "page": page, "pageSize": page_size}
+
+
+# ============ 系统设置辅助（key 校验 / 操作日志） ============
+
+_SETTING_KEY_RE = re.compile(r"^[A-Za-z_]+$")
+
+
+def _validate_setting_key(key: str) -> str:
+    key = key.strip()
+    if not (1 <= len(key) < 64):
+        raise HTTPException(status_code=422, detail="键名长度需在 1-63 之间")
+    if not _SETTING_KEY_RE.match(key):
+        raise HTTPException(status_code=422, detail="键名只能包含英文字母和下划线")
+    return key
+
+
+def _log_setting(key: str, admin: dict, content: str, content_en: str = "") -> None:
+    execute(
+        "INSERT INTO setting_logs (setting_key, content, content_en, operator, created_at) VALUES (?, ?, ?, ?, ?)",
+        (key, content, content_en, admin.get("username") or "", now_ms()),
+    )
 
 
 # ============ 通用维表（dim_tables / dim_values） ============
@@ -1006,8 +1373,8 @@ def list_dim_values(
     clauses = ["table_id = ?"]
     params: list = [table_id]
     if search:
-        clauses.append("(code LIKE ? OR name LIKE ? OR remark LIKE ?)")
-        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+        clauses.append("(code LIKE ? OR name LIKE ? OR name_en LIKE ? OR remark LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%"])
     if enabled:
         clauses.append("enabled = ?")
         params.append(1 if enabled.strip().lower() == "true" else 0)
@@ -1015,6 +1382,7 @@ def list_dim_values(
     sort_columns = {
         "code": "code",
         "name": "name",
+        "name_en": "name_en",
         "sort_order": "sort_order",
         "enabled": "enabled",
         "remark": "remark",
@@ -1032,6 +1400,29 @@ def list_dim_values(
     return DimValueList(items=items, total=total, page=page, pageSize=page_size)
 
 
+# 英文名称禁止出现汉字（CJK 统一表意文字）
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def _is_model_provider_table(table_id: int) -> bool:
+    t = fetch_one("SELECT code FROM dim_tables WHERE id = ?", (table_id,))
+    return bool(t and t["code"] == "model_provider")
+
+
+def _validate_dim_name_en(table_id: int, name_en: str | None, *, required: bool) -> str | None:
+    """模型供应商维表的英文名校验：必填 + 不允许中文。返回错误文案或 None。"""
+    if not _is_model_provider_table(table_id):
+        return None
+    if name_en is None:
+        return None
+    val = name_en.strip()
+    if required and not val:
+        return "模型供应商维表的英文名称不能为空"
+    if _CJK_RE.search(val):
+        return "英文名称不允许包含中文"
+    return None
+
+
 @router.post("/dim-tables/{table_id}/values")
 def create_dim_value(
     table_id: int, body: DimValueCreate, admin: dict = Depends(require_settings_admin)
@@ -1039,6 +1430,9 @@ def create_dim_value(
     table = fetch_one("SELECT id FROM dim_tables WHERE id = ?", (table_id,))
     if not table:
         raise HTTPException(status_code=404, detail="维表不存在")
+    err = _validate_dim_name_en(table_id, body.name_en, required=True)
+    if err:
+        raise HTTPException(status_code=422, detail=err)
     dup = fetch_one(
         "SELECT id FROM dim_values WHERE table_id = ? AND code = ?", (table_id, body.code)
     )
@@ -1046,12 +1440,13 @@ def create_dim_value(
         raise HTTPException(status_code=400, detail="该编码在当前维表已存在")
     ts = now_ms()
     execute(
-        "INSERT INTO dim_values (table_id, code, name, sort_order, enabled, remark, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO dim_values (table_id, code, name, name_en, sort_order, enabled, remark, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             table_id,
             body.code,
             body.name,
+            (body.name_en or "").strip(),
             body.sort_order,
             1 if body.enabled else 0,
             body.remark,
@@ -1088,6 +1483,12 @@ def update_dim_value(
     if body.name is not None:
         updates.append("name = ?")
         params.append(body.name)
+    if body.name_en is not None:
+        err = _validate_dim_name_en(table_id, body.name_en, required=True)
+        if err:
+            raise HTTPException(status_code=422, detail=err)
+        updates.append("name_en = ?")
+        params.append(body.name_en.strip())
     if body.sort_order is not None:
         updates.append("sort_order = ?")
         params.append(body.sort_order)
@@ -1119,15 +1520,20 @@ def delete_dim_value(
 
 
 @router.get("/dim-tables/by-code/{code}/values")
-def list_dim_values_by_code(code: str, admin: dict = Depends(require_settings_admin)):
-    """下拉专用：返回某维表启用取值的 [{code, name}] 列表。"""
+def list_dim_values_by_code(
+    code: str, request: Request, admin: dict = Depends(require_settings_admin)
+):
+    """下拉专用：返回某维表启用取值的 [{code, name}]，name 按 Accept-Language 返回中文或英文。"""
+    is_en = "en" in (request.headers.get("accept-language") or "").lower()
     table = fetch_one("SELECT id FROM dim_tables WHERE code = ?", (code,))
     if not table:
         return []
     rows = fetch_all(
-        "SELECT code, name FROM dim_values WHERE table_id = ? AND enabled = 1 ORDER BY sort_order, id",
+        "SELECT code, name, name_en FROM dim_values WHERE table_id = ? AND enabled = 1 ORDER BY sort_order, id",
         (table["id"],),
     )
+    if is_en:
+        return [{"code": r["code"], "name": (r["name_en"] or r["name"])} for r in rows]
     return [{"code": r["code"], "name": r["name"]} for r in rows]
 
 

@@ -98,21 +98,56 @@ class ResetPasswordRequest(BaseModel):
 
 
 class ModelPayload(BaseModel):
-    model_key: str
-    name: str
-    provider: str = "openai"
+    model_key: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=100)
+    name_en: str = Field(default="", max_length=100)
+    provider: str = Field(default="openai", max_length=50)
     free: bool = False
     vision: bool = False
     supports_search: bool = True
     enabled: bool = True
-    sort_order: int = 0
+    sort_order: int = Field(default=0, ge=0, le=999999)
     is_default: bool = False
+
+    @field_validator("model_key", "name", "name_en", "provider", mode="before")
+    @classmethod
+    def _strip_str(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("model_key")
+    @classmethod
+    def _key_no_whitespace(cls, v):
+        if any(c.isspace() for c in v):
+            raise ValueError("model_key 不能包含空白字符")
+        return v
+
+    @field_validator("name_en")
+    @classmethod
+    def _name_en_no_chinese(cls, v):
+        if v and any("一" <= c <= "鿿" or "㐀" <= c <= "䶿" for c in v):
+            raise ValueError("name_en 不能包含中文")
+        return v
 
 
 class SettingsPayload(BaseModel):
-    value: str | None = Field(default=None, max_length=2000)
+    value: str | None = Field(default=None, max_length=4999)
     remark: str | None = Field(default=None, max_length=255)
     enabled: bool | None = None
+
+
+class SettingLogOut(BaseModel):
+    id: int
+    setting_key: str
+    content: str
+    operator: str
+    created_at: int
+
+
+class SettingLogList(BaseModel):
+    items: list[SettingLogOut]
+    total: int
+    page: int
+    pageSize: int
 
 
 # ============ 通用维表（dim_tables / dim_values） ============
@@ -135,6 +170,7 @@ class DimValueOut(BaseModel):
     table_id: int
     code: str
     name: str
+    name_en: str = ""
     sort_order: int
     enabled: int
     remark: str
@@ -164,6 +200,7 @@ class DimTableUpdate(BaseModel):
 class DimValueCreate(BaseModel):
     code: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     name: str = Field(min_length=1, max_length=128)
+    name_en: str = Field(default="", max_length=128)
     sort_order: int = Field(default=0, ge=0, le=999999)
     enabled: bool = True
     remark: str = Field(default="", max_length=255)
@@ -173,6 +210,7 @@ class DimValueUpdate(BaseModel):
     # 传 None 表示"不更新该字段"（Pydantic 对 None 跳过 pattern/ge 校验，与 admin.py 语义一致）
     code: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     name: str | None = Field(default=None, min_length=1, max_length=128)
+    name_en: str | None = Field(default=None, max_length=128)
     sort_order: int | None = Field(default=None, ge=0, le=999999)
     enabled: bool | None = None
     remark: str | None = Field(default=None, max_length=255)
