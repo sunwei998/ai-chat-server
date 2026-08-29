@@ -110,8 +110,8 @@ class ModelPayload(BaseModel):
 
 
 class SettingsPayload(BaseModel):
-    value: str | None = None
-    remark: str | None = None
+    value: str | None = Field(default=None, max_length=2000)
+    remark: str | None = Field(default=None, max_length=255)
     enabled: bool | None = None
 
 
@@ -162,16 +162,17 @@ class DimTableUpdate(BaseModel):
 
 
 class DimValueCreate(BaseModel):
-    code: str = Field(min_length=1, max_length=64)
+    code: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     name: str = Field(min_length=1, max_length=128)
-    sort_order: int = 0
+    sort_order: int = Field(default=0, ge=0, le=999999)
     enabled: bool = True
-    remark: str = ""
+    remark: str = Field(default="", max_length=255)
 
 
 class DimValueUpdate(BaseModel):
-    code: str | None = Field(default=None, max_length=64)
-    name: str | None = Field(default=None, max_length=128)
-    sort_order: int | None = None
+    # 传 None 表示"不更新该字段"（Pydantic 对 None 跳过 pattern/ge 校验，与 admin.py 语义一致）
+    code: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    sort_order: int | None = Field(default=None, ge=0, le=999999)
     enabled: bool | None = None
-    remark: str | None = None
+    remark: str | None = Field(default=None, max_length=255)
