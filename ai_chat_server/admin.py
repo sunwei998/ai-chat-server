@@ -9,11 +9,13 @@ import openpyxl
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from .auth import (
     ROLE_SUPER_ADMIN,
+    ROLE_SYSTEM_ADMIN,
     compute_age,
     hash_password,
     require_admin,
@@ -1396,7 +1398,14 @@ def list_dim_values(
         f"SELECT * FROM dim_values {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
         (*params, page_size, offset),
     )
-    items = [DimValueOut(**dict(r)) for r in rows]
+    # 非 super/system 管理员：api_key 脱敏回显（中间星号），避免明文扩散
+    privileged = admin.get("role") in (ROLE_SUPER_ADMIN, ROLE_SYSTEM_ADMIN)
+    items = []
+    for r in rows:
+        d = dict(r)
+        if not privileged:
+            d["api_key"] = _mask_secret(d.get("api_key"))
+        items.append(DimValueOut(**d))
     return DimValueList(items=items, total=total, page=page, pageSize=page_size)
 
 
@@ -1423,6 +1432,41 @@ def _validate_dim_name_en(table_id: int, name_en: str | None, *, required: bool)
     return None
 
 
+# 连续 4 个及以上 * 视为「掩码回显」：非特权角色看到掩码后若原样回传，不得覆盖真实密钥
+_MASK_RE = re.compile(r"\*{4,}")
+
+
+def _is_masked_secret(s: str | None) -> bool:
+    return bool(s) and bool(_MASK_RE.search(s or ""))
+
+
+def _mask_secret(s: str | None) -> str:
+    """非特权角色列表回显脱敏：保留前 3 后 4，中间固定 8 个 *；过短则全掩码。"""
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return "********"
+    return f"{s[:3]}********{s[-4:]}"
+
+
+def _provider_needs_key(code: str | None) -> bool:
+    """ollama 为本地部署、无需 API 密钥，启用规则予以豁免。"""
+    return (code or "") != "ollama"
+
+
+def _validate_provider_enable(
+    table_id: int, code: str | None, api_key: str | None, enabled: bool
+) -> str | None:
+    """模型供应商维表：要启用（enabled=True）必须已配置真实 api_key（ollama 豁免）。返回错误文案或 None。"""
+    if not _is_model_provider_table(table_id):
+        return None
+    if not enabled or not _provider_needs_key(code):
+        return None
+    if not (api_key or "").strip() or _is_masked_secret(api_key):
+        return "API 密钥是启用提供商的必要条件，请先填写 API 密钥"
+    return None
+
+
 @router.post("/dim-tables/{table_id}/values")
 def create_dim_value(
     table_id: int, body: DimValueCreate, admin: dict = Depends(require_settings_admin)
@@ -1433,6 +1477,11 @@ def create_dim_value(
     err = _validate_dim_name_en(table_id, body.name_en, required=True)
     if err:
         raise HTTPException(status_code=422, detail=err)
+    # 掩码回显原样提交视为未填写，避免覆盖真实密钥
+    api_key = "" if _is_masked_secret(body.api_key) else (body.api_key or "").strip()
+    enable_err = _validate_provider_enable(table_id, body.code, api_key, body.enabled)
+    if enable_err:
+        raise HTTPException(status_code=422, detail=enable_err)
     dup = fetch_one(
         "SELECT id FROM dim_values WHERE table_id = ? AND code = ?", (table_id, body.code)
     )
@@ -1440,13 +1489,14 @@ def create_dim_value(
         raise HTTPException(status_code=400, detail="该编码在当前维表已存在")
     ts = now_ms()
     execute(
-        "INSERT INTO dim_values (table_id, code, name, name_en, sort_order, enabled, remark, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO dim_values (table_id, code, name, name_en, api_key, sort_order, enabled, remark, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             table_id,
             body.code,
             body.name,
             (body.name_en or "").strip(),
+            api_key,
             body.sort_order,
             1 if body.enabled else 0,
             body.remark,
@@ -1465,7 +1515,8 @@ def update_dim_value(
     admin: dict = Depends(require_settings_admin),
 ):
     row = fetch_one(
-        "SELECT id FROM dim_values WHERE id = ? AND table_id = ?", (value_id, table_id)
+        "SELECT id, code, api_key, enabled FROM dim_values WHERE id = ? AND table_id = ?",
+        (value_id, table_id),
     )
     if not row:
         raise HTTPException(status_code=404, detail="维表取值不存在")
@@ -1489,6 +1540,10 @@ def update_dim_value(
             raise HTTPException(status_code=422, detail=err)
         updates.append("name_en = ?")
         params.append(body.name_en.strip())
+    # api_key：掩码回显原样提交时跳过，绝不用星号覆盖真实密钥
+    if body.api_key is not None and not _is_masked_secret(body.api_key):
+        updates.append("api_key = ?")
+        params.append(body.api_key.strip())
     if body.sort_order is not None:
         updates.append("sort_order = ?")
         params.append(body.sort_order)
@@ -1499,6 +1554,16 @@ def update_dim_value(
         updates.append("remark = ?")
         params.append(body.remark)
     if updates:
+        # 启用校验：合并「传入值 + 现值」得到最终状态，要启用就必须有真实密钥（ollama 豁免）
+        final_code = body.code if body.code is not None else row["code"]
+        if body.api_key is not None and not _is_masked_secret(body.api_key):
+            final_key = body.api_key.strip()
+        else:
+            final_key = row["api_key"]
+        final_enabled = body.enabled if body.enabled is not None else bool(row["enabled"])
+        enable_err = _validate_provider_enable(table_id, final_code, final_key, final_enabled)
+        if enable_err:
+            raise HTTPException(status_code=422, detail=enable_err)
         updates.append("updated_at = ?")
         params.append(now_ms())
         params.append(value_id)
@@ -1535,6 +1600,286 @@ def list_dim_values_by_code(
     if is_en:
         return [{"code": r["code"], "name": (r["name_en"] or r["name"])} for r in rows]
     return [{"code": r["code"], "name": r["name"]} for r in rows]
+
+
+# ============ 维表取值：公共导入 / 导出 / 模板（字段规格驱动，新增维表自动复用） ============
+
+def _dim_table_or_404(table_id: int) -> dict:
+    t = fetch_one("SELECT * FROM dim_tables WHERE id = ?", (table_id,))
+    if not t:
+        raise HTTPException(status_code=404, detail="维表不存在")
+    return dict(t)
+
+
+def _dim_value_field_spec(table_code: str) -> list[dict]:
+    """维表取值的列规格，统一驱动「导出表头 / 模板 / 导入解析与校验 / upsert」。
+    以后新增维表：通用列自动覆盖；若有专属列，只需在此按 table_code 扩展，接口无需重写。
+    字段含义：required 必填；max_len 长度上限；no_cjk 禁中文；is_int 整型；is_bool 布尔。"""
+    fields: list[dict] = [
+        {"key": "code", "required": True, "max_len": 64},
+        {"key": "name", "required": True, "max_len": 128},
+    ]
+    if table_code == "model_provider":
+        fields.append({"key": "name_en", "required": True, "max_len": 128, "no_cjk": True})
+        fields.append({"key": "api_key", "max_len": 512})
+    fields.extend(
+        [
+            {"key": "sort_order", "is_int": True, "default": 0},
+            {"key": "enabled", "is_bool": True, "default": 1},
+            {"key": "remark", "max_len": 255},
+        ]
+    )
+    return fields
+
+
+def _dim_xlsx_response(wb: openpyxl.Workbook, filename: str) -> StreamingResponse:
+    buf = io.BytesIO()
+    wb.save(buf)
+    data = buf.getvalue()
+    return StreamingResponse(
+        iter([data]),
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/dim-tables/{table_id}/export")
+def export_dim_values(
+    table_id: int, request: Request, admin: dict = Depends(require_settings_admin)
+):
+    """导出某维表全部取值为 xlsx（列由字段规格决定，model_provider 含 name_en/api_key）。"""
+    table = _dim_table_or_404(table_id)
+    spec = _dim_value_field_spec(table["code"])
+    keys = [f["key"] for f in spec]
+    rows = fetch_all(
+        "SELECT * FROM dim_values WHERE table_id = ? ORDER BY sort_order, id", (table_id,)
+    )
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "values"
+    ws.append(keys)
+    for r in rows:
+        ws.append(["" if r[k] is None else r[k] for k in keys])
+    username = admin.get("username") or "admin"
+    fname = f"dim_{table['code']}_{now_ms()}.xlsx"
+    resp = _dim_xlsx_response(wb, fname)
+    # 导出行为记录（不落盘产物）
+    buf_size = sum(1 for _ in rows)
+    _write_transfer_meta(
+        "export", username, fname, buf_size, _XLSX_MIME,
+        remark=f"维表「{table['name']}」导出",
+    )
+    return resp
+
+
+@router.get("/dim-tables/{table_id}/template")
+def download_dim_template(
+    table_id: int, request: Request, admin: dict = Depends(require_settings_admin)
+):
+    """下载维表取值导入模板：英文字段表头 + 本地化示例行 + enabled 布尔下拉。"""
+    table = _dim_table_or_404(table_id)
+    is_en = "en" in (request.headers.get("accept-language") or "").lower()
+    spec = _dim_value_field_spec(table["code"])
+    keys = [f["key"] for f in spec]
+    is_provider = table["code"] == "model_provider"
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "values"
+    ws.append(keys)
+    if is_provider:
+        example = (
+            ["example_code", "Example Name", "Example EN Name", "sk-xxxx", 0, "yes", ""]
+            if is_en
+            else ["example_code", "示例名称", "Example Name", "sk-xxxx", 0, "是", ""]
+        )
+    else:
+        example = (
+            ["example_code", "Example Name", 0, "yes", ""]
+            if is_en
+            else ["example_code", "示例名称", 0, "是", ""]
+        )
+    ws.append(example)
+
+    # enabled 列布尔下拉
+    enabled_idx = keys.index("enabled") + 1
+    letter = get_column_letter(enabled_idx)
+    dv = DataValidation(
+        type="list",
+        formula1='"yes,no"' if is_en else '"是,否"',
+        allow_blank=True,
+        showDropDown=False,
+    )
+    dv.error = 'Please choose "yes" or "no"' if is_en else "请选择「是」或「否」"
+    dv.errorTitle = "Invalid value" if is_en else "非法值"
+    ws.add_data_validation(dv)
+    dv.add(f"{letter}2:{letter}1000")
+
+    return _dim_xlsx_response(wb, f"dim_{table['code']}_template.xlsx")
+
+
+@router.post("/dim-tables/{table_id}/import")
+async def import_dim_values(
+    table_id: int, file: UploadFile = File(...), admin: dict = Depends(require_settings_admin)
+):
+    """从 xlsx 批量导入维表取值：同表 code 已存在则更新，否则新增。列与校验由字段规格驱动。"""
+    table = _dim_table_or_404(table_id)
+    spec = _dim_value_field_spec(table["code"])
+    spec_by_key = {f["key"]: f for f in spec}
+    keys = [f["key"] for f in spec]
+
+    raw = await file.read()
+    original_name = file.filename or "dim_import.xlsx"
+    username = admin.get("username") or "admin"
+    if len(raw) > 10 * 1024 * 1024:
+        _write_transfer_meta(
+            "import", username, original_name, len(raw), _XLSX_MIME,
+            remark=f"维表「{table['name']}」导入：文件过大（上限 10MB）", status="failed",
+        )
+        raise HTTPException(status_code=400, detail="文件过大（上限 10MB）")
+
+    saved_path, record_id = _write_transfer_record(
+        "import", username, original_name, raw, _XLSX_MIME,
+        remark=f"维表「{table['name']}」导入", status="",
+    )
+
+    def _mark_failed(reason: str) -> None:
+        execute(
+            "UPDATE transfer_records SET status='failed', remark=? WHERE id=?",
+            (f"维表「{table['name']}」导入：{reason}", record_id),
+        )
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
+    except Exception:
+        _mark_failed("无法解析文件")
+        raise HTTPException(status_code=400, detail="无法解析文件，请上传有效的 .xlsx 文件")
+
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        header_row = next(rows_iter)
+    except StopIteration:
+        _mark_failed("空文件")
+        raise HTTPException(status_code=400, detail="空文件")
+
+    header = [str(h).strip().lower() if h is not None else "" for h in header_row]
+    for must in ("code", "name"):
+        if must not in header:
+            _mark_failed(f"缺少 {must} 列")
+            raise HTTPException(status_code=400, detail=f"xlsx 缺少 {must} 列")
+    # 只识别规格内、且表头里存在的列
+    idx = {h: i for i, h in enumerate(header)}
+    active_keys = [k for k in keys if k in idx]
+
+    def cell(row, key: str, default=""):
+        i = idx.get(key)
+        if i is None or i >= len(row) or row[i] is None:
+            return default
+        return row[i]
+
+    created = 0
+    updated = 0
+    errors: list[str] = []
+    row_errors: dict[int, str] = {}
+    seen_codes: set[str] = set()
+
+    for n, row in enumerate(rows_iter, start=2):
+        if row is None or not any(c is not None and str(c).strip() for c in row):
+            continue
+        code = str(cell(row, "code", "")).strip()
+        name = str(cell(row, "name", "")).strip()
+        if not code or not name:
+            reason = "code/name 不能为空"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+        if code in seen_codes:
+            reason = f"文件内编码重复：{code}"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+
+        # 按规格逐列解析 + 校验
+        values: dict[str, object] = {"code": code, "name": name}
+        bad = None
+        for k in active_keys:
+            f = spec_by_key[k]
+            raw_v = cell(row, k, "" if not f.get("is_bool") and not f.get("is_int") else 0)
+            if f.get("is_bool"):
+                values[k] = _parse_bool(raw_v)
+            elif f.get("is_int"):
+                try:
+                    values[k] = int(float(raw_v if raw_v != "" else f.get("default", 0)))
+                except (ValueError, TypeError):
+                    values[k] = f.get("default", 0)
+            else:
+                sval = str(raw_v or "").strip()
+                if f.get("required") and not sval:
+                    bad = f"{k} 不能为空"
+                    break
+                if f.get("max_len") and len(sval) > f["max_len"]:
+                    bad = f"{k} 长度超限（{f['max_len']}）"
+                    break
+                if f.get("no_cjk") and _CJK_RE.search(sval):
+                    bad = f"{k} 不允许包含中文"
+                    break
+                values[k] = sval
+        if bad:
+            errors.append(f"第 {n} 行：{bad}")
+            row_errors[n] = bad
+            continue
+
+        # 启用校验：模型供应商（ollama 豁免）要启用必须带 api_key
+        row_enabled = bool(values.get("enabled", 1))
+        enable_bad = _validate_provider_enable(
+            table_id, code, str(values.get("api_key", "")), row_enabled
+        )
+        if enable_bad:
+            errors.append(f"第 {n} 行：{enable_bad}")
+            row_errors[n] = enable_bad
+            continue
+
+        exists = fetch_one(
+            "SELECT id FROM dim_values WHERE table_id = ? AND code = ?", (table_id, code)
+        )
+        col_keys = [k for k in active_keys]
+        if exists:
+            set_clause = ", ".join(f"{k} = ?" for k in col_keys)
+            params = [values[k] for k in col_keys] + [now_ms(), exists["id"]]
+            execute(
+                f"UPDATE dim_values SET {set_clause}, updated_at = ? WHERE id = ?", params
+            )
+            updated += 1
+        else:
+            cols = ["table_id"] + col_keys + ["created_at", "updated_at"]
+            placeholders = ", ".join(["?"] * len(cols))
+            params = [table_id] + [values[k] for k in col_keys] + [now_ms(), now_ms()]
+            execute(f"INSERT INTO dim_values ({', '.join(cols)}) VALUES ({placeholders})", params)
+            created += 1
+        seen_codes.add(code)
+
+    if row_errors and (created + updated) == 0:
+        status = "failed"
+    elif row_errors:
+        status = "partial"
+    else:
+        status = "success"
+
+    if row_errors:
+        try:
+            ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name)
+            if os.path.isfile(saved_path):
+                os.remove(saved_path)
+            execute(
+                "UPDATE transfer_records SET file_path=?, file_size=? WHERE id=?",
+                (ann_path, ann_size, record_id),
+            )
+        except Exception:
+            pass
+
+    execute("UPDATE transfer_records SET status=? WHERE id=?", (status, record_id))
+    return {"ok": True, "created": created, "updated": updated, "errors": errors}
 
 
 # ============ 导入 / 导出记录（所有管理员可见，可下载源文件） ============

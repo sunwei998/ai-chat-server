@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS dim_values (
   code TEXT NOT NULL,
   name TEXT NOT NULL,
   name_en TEXT NOT NULL DEFAULT '',
+  api_key TEXT NOT NULL DEFAULT '',
   sort_order INTEGER NOT NULL DEFAULT 0,
   enabled INTEGER NOT NULL DEFAULT 1,
   remark TEXT NOT NULL DEFAULT '',
@@ -207,6 +208,8 @@ def _migrate() -> None:
     dv_cols = {r[1] for r in conn.execute("PRAGMA table_info(dim_values)")}
     if "name_en" not in dv_cols:
         conn.execute("ALTER TABLE dim_values ADD COLUMN name_en TEXT NOT NULL DEFAULT ''")
+    if "api_key" not in dv_cols:
+        conn.execute("ALTER TABLE dim_values ADD COLUMN api_key TEXT NOT NULL DEFAULT ''")
     model_cols = {r[1] for r in conn.execute("PRAGMA table_info(models)")}
     if "supports_search" not in model_cols:
         conn.execute("ALTER TABLE models ADD COLUMN supports_search INTEGER NOT NULL DEFAULT 1")
@@ -419,6 +422,20 @@ def _refresh_provider_names(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _enforce_provider_api_key(conn: sqlite3.Connection) -> None:
+    """业务规则落地：模型供应商（本地 ollama 无需密钥、予以豁免）必须配置 api_key 才能启用。
+    幂等：每次启动把「非 ollama 且 api_key 为空」的供应商强制置为禁用。"""
+    table = conn.execute("SELECT id FROM dim_tables WHERE code = 'model_provider'").fetchone()
+    if not table:
+        return
+    conn.execute(
+        "UPDATE dim_values SET enabled = 0 WHERE table_id = ? AND code <> 'ollama' "
+        "AND (api_key IS NULL OR api_key = '')",
+        (table["id"],),
+    )
+    conn.commit()
+
+
 def init_db() -> None:
     with _lock:
         conn = _connect()
@@ -429,6 +446,7 @@ def init_db() -> None:
         _migrate_model_providers(conn)
         _seed_dim_tables(conn)
         _refresh_provider_names(conn)
+        _enforce_provider_api_key(conn)
         _ensure_default_model(conn)
 
 

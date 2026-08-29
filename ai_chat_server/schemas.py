@@ -171,6 +171,7 @@ class DimValueOut(BaseModel):
     code: str
     name: str
     name_en: str = ""
+    api_key: str = ""
     sort_order: int
     enabled: int
     remark: str
@@ -201,6 +202,7 @@ class DimValueCreate(BaseModel):
     code: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     name: str = Field(min_length=1, max_length=128)
     name_en: str = Field(default="", max_length=128)
+    api_key: str = Field(default="", max_length=512)
     sort_order: int = Field(default=0, ge=0, le=999999)
     enabled: bool = True
     remark: str = Field(default="", max_length=255)
@@ -211,6 +213,7 @@ class DimValueUpdate(BaseModel):
     code: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     name: str | None = Field(default=None, min_length=1, max_length=128)
     name_en: str | None = Field(default=None, max_length=128)
+    api_key: str | None = Field(default=None, max_length=512)
     sort_order: int | None = Field(default=None, ge=0, le=999999)
     enabled: bool | None = None
     remark: str | None = Field(default=None, max_length=255)

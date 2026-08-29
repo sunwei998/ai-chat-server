@@ -147,10 +147,29 @@ def _build_payload(model: dict, body: ChatRequest) -> dict:
     }
 
 
+def _provider_api_key(provider: str) -> str:
+    """取「模型供应商」维表中为该 provider 维护的 api_key（唯一来源，后端不再预置/兜底）。
+    ollama 为本地部署、无需密钥，直接返回空串。"""
+    if provider == "ollama":
+        return ""
+    try:
+        row = fetch_one(
+            "SELECT dv.api_key AS api_key FROM dim_values dv "
+            "JOIN dim_tables dt ON dt.id = dv.table_id "
+            "WHERE dt.code = 'model_provider' AND dv.code = ?",
+            (provider,),
+        )
+        if row and row["api_key"]:
+            return row["api_key"]
+    except Exception:  # 维表异常不抛出，交由上层「未配置密钥」校验处理
+        logging.getLogger(__name__).exception("读取供应商 api_key 失败")
+    return ""
+
+
 def _headers(model: dict) -> dict:
     headers = {"Content-Type": "application/json"}
     if model["provider"] != "ollama":
-        headers["Authorization"] = f"Bearer {settings.siliconflow_api_key}"
+        headers["Authorization"] = f"Bearer {_provider_api_key(model['provider'])}"
     return headers
 
 
@@ -370,8 +389,8 @@ async def chat(
     url = _endpoint(model)
     headers = _headers(model)
 
-    if not settings.siliconflow_api_key and model["provider"] != "ollama":
-        raise HTTPException(status_code=500, detail="服务端未配置 API key")
+    if not _provider_api_key(model["provider"]) and model["provider"] != "ollama":
+        raise HTTPException(status_code=500, detail="该模型供应商未配置 API 密钥，请在管理后台配置后启用")
 
     assistant_msg_id = body.assistant_message_id or (
         f"assistant_{now_ms()}_{secrets.token_hex(4)}" if session_id else ""
