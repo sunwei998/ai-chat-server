@@ -71,6 +71,33 @@ CREATE TABLE IF NOT EXISTS settings (
   enabled INTEGER NOT NULL DEFAULT 1
 );
 
+CREATE TABLE IF NOT EXISTS dim_tables (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER,
+  updated_by TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS dim_values (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_id INTEGER NOT NULL,
+  code TEXT NOT NULL,
+  name TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  remark TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER,
+  UNIQUE (table_id, code),
+  FOREIGN KEY (table_id) REFERENCES dim_tables(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_dim_values_table ON dim_values (table_id);
+
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL,
@@ -167,40 +194,91 @@ def _migrate() -> None:
     conn.commit()
 
 
+# 默认模型供应商（同时作为维表 model_provider 的 seed 与前端极端降级）
+DEFAULT_MODEL_PROVIDERS = [
+    ("openai", "OpenAI"),
+    ("anthropic", "Anthropic Claude"),
+    ("google", "Google Gemini"),
+    ("deepseek", "DeepSeek"),
+    ("qwen", "通义千问 Qwen"),
+    ("zhipu", "智谱 GLM"),
+    ("moonshot", "Moonshot Kimi"),
+    ("doubao", "豆包 Doubao"),
+    ("baidu", "百度文心 ERNIE"),
+    ("tencent", "腾讯混元 Hunyuan"),
+    ("minimax", "MiniMax"),
+    ("mistral", "Mistral"),
+    ("meta", "Meta Llama"),
+    ("groq", "Groq"),
+    ("openrouter", "OpenRouter"),
+    ("cohere", "Cohere"),
+    ("xai", "xAI Grok"),
+    ("stepfun", "阶跃星辰 StepFun"),
+    ("siliconflow", "硅基流动 SiliconFlow"),
+    ("ollama", "Ollama"),
+]
+
+
+def _seed_dim_tables(conn: sqlite3.Connection) -> None:
+    """维表默认数据：model_provider（模型供应商）。已存在则跳过。"""
+    row = conn.execute("SELECT id FROM dim_tables WHERE code = 'model_provider'").fetchone()
+    if row:
+        return
+    ts = now_ms()
+    cur = conn.execute(
+        "INSERT INTO dim_tables (code, name, description, sort_order, created_at, updated_at, updated_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("model_provider", "模型供应商", "模型 provider 维表，供模型管理下拉与导入模板复用", 0, ts, ts, "system"),
+    )
+    table_id = cur.lastrowid
+    for idx, (code, name) in enumerate(DEFAULT_MODEL_PROVIDERS):
+        conn.execute(
+            "INSERT OR IGNORE INTO dim_values (table_id, code, name, sort_order, enabled, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?)",
+            (table_id, code, name, idx, ts, ts),
+        )
+    conn.commit()
+
+
+def _migrate_model_providers(conn: sqlite3.Connection) -> None:
+    """旧库兼容：把 settings.model_providers（JSON 数组）一次性迁为 model_provider 维表。"""
+    existing = conn.execute("SELECT id FROM dim_tables WHERE code = 'model_provider'").fetchone()
+    if existing:
+        return
+    row = conn.execute("SELECT value FROM settings WHERE key = 'model_providers'").fetchone()
+    if not row or not row["value"]:
+        return
+    try:
+        parsed = json.loads(row["value"])
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(parsed, list):
+        return
+    ts = now_ms()
+    cur = conn.execute(
+        "INSERT INTO dim_tables (code, name, description, sort_order, created_at, updated_at, updated_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("model_provider", "模型供应商", "由 settings.model_providers 迁移而来", 0, ts, ts, "system"),
+    )
+    table_id = cur.lastrowid
+    for idx, item in enumerate(parsed):
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO dim_values (table_id, code, name, sort_order, enabled, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?)",
+            (table_id, str(item["id"]), str(item.get("name", item["id"])), idx, ts, ts),
+        )
+    conn.commit()
+    # 迁移完成，删除旧 settings 行，避免双源
+    conn.execute("DELETE FROM settings WHERE key = 'model_providers'")
+
+
 def _seed_settings(conn: sqlite3.Connection) -> None:
     """对话分页、模型提供方数据字典等默认配置项：缺失时写入默认值。"""
     defaults = [
         ("chat_initial_page_size", "10", "会话首次打开时加载的最新消息条数"),
         ("chat_page_size", "10", "向上滚动时每次加载的更早消息条数"),
-        (
-            "model_providers",
-            json.dumps(
-                [
-                    {"id": "openai", "name": "OpenAI"},
-                    {"id": "anthropic", "name": "Anthropic Claude"},
-                    {"id": "google", "name": "Google Gemini"},
-                    {"id": "deepseek", "name": "DeepSeek"},
-                    {"id": "qwen", "name": "通义千问 Qwen"},
-                    {"id": "zhipu", "name": "智谱 GLM"},
-                    {"id": "moonshot", "name": "Moonshot Kimi"},
-                    {"id": "doubao", "name": "豆包 Doubao"},
-                    {"id": "baidu", "name": "百度文心 ERNIE"},
-                    {"id": "tencent", "name": "腾讯混元 Hunyuan"},
-                    {"id": "minimax", "name": "MiniMax"},
-                    {"id": "mistral", "name": "Mistral"},
-                    {"id": "meta", "name": "Meta Llama"},
-                    {"id": "groq", "name": "Groq"},
-                    {"id": "openrouter", "name": "OpenRouter"},
-                    {"id": "cohere", "name": "Cohere"},
-                    {"id": "xai", "name": "xAI Grok"},
-                    {"id": "stepfun", "name": "阶跃星辰 StepFun"},
-                    {"id": "siliconflow", "name": "硅基流动 SiliconFlow"},
-                    {"id": "ollama", "name": "Ollama"},
-                ],
-                ensure_ascii=False,
-            ),
-            "模型提供方数据字典（JSON 数组：[{\"id\",\"name\"}]）",
-        ),
         # 联网搜索默认配置（缺失时写入，使 init 即生效、后台可读可改）
         (
             "websearch_providers",
@@ -256,6 +334,8 @@ def init_db() -> None:
         conn.commit()
         _migrate()
         _seed_settings(conn)
+        _migrate_model_providers(conn)
+        _seed_dim_tables(conn)
         _ensure_default_model(conn)
 
 

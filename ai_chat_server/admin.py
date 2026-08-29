@@ -21,6 +21,13 @@ from .auth import (
 from .config import settings
 from .db import execute, fetch_all, fetch_one, now_ms, transaction
 from .schemas import (
+    DimTableCreate,
+    DimTableOut,
+    DimTableUpdate,
+    DimValueCreate,
+    DimValueList,
+    DimValueOut,
+    DimValueUpdate,
     ModelPayload,
     ResetPasswordRequest,
     SettingsPayload,
@@ -591,17 +598,15 @@ def export_models(admin: dict = Depends(require_model_admin)):
 
 
 def _get_provider_ids() -> list[str]:
-    """读取 settings.model_providers 字典，返回 provider id 列表。"""
-    row = fetch_one("SELECT value FROM settings WHERE key = 'model_providers'")
-    if not row or not row["value"]:
+    """读取 model_provider 维表的启用值 code 列表（供模型导入模板下拉）。"""
+    table = fetch_one("SELECT id FROM dim_tables WHERE code = 'model_provider'")
+    if not table:
         return []
-    try:
-        parsed = json.loads(row["value"])
-        if isinstance(parsed, list):
-            return [str(p.get("id")) for p in parsed if isinstance(p, dict) and p.get("id")]
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return []
+    rows = fetch_all(
+        "SELECT code FROM dim_values WHERE table_id = ? AND enabled = 1 ORDER BY sort_order, id",
+        (table["id"],),
+    )
+    return [r["code"] for r in rows]
 
 
 @router.get("/models/template")
@@ -905,6 +910,225 @@ def update_setting(key: str, body: SettingsPayload, admin: dict = Depends(requir
         params.append(key)
         execute(f"UPDATE settings SET {', '.join(updates)} WHERE key = ?", params)
     return {"ok": True}
+
+
+# ============ 通用维表（dim_tables / dim_values） ============
+
+
+def _dim_table_out(row) -> DimTableOut:
+    count = fetch_one(
+        "SELECT COUNT(*) AS n FROM dim_values WHERE table_id = ?", (row["id"],)
+    )["n"]
+    return DimTableOut(
+        id=row["id"],
+        code=row["code"],
+        name=row["name"],
+        description=row["description"] or "",
+        sort_order=row["sort_order"] or 0,
+        value_count=count,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        updated_by=row["updated_by"] or "",
+    )
+
+
+@router.get("/dim-tables")
+def list_dim_tables(admin: dict = Depends(require_settings_admin)):
+    rows = fetch_all("SELECT * FROM dim_tables ORDER BY sort_order, id")
+    return [_dim_table_out(r) for r in rows]
+
+
+@router.post("/dim-tables")
+def create_dim_table(body: DimTableCreate, admin: dict = Depends(require_settings_admin)):
+    existing = fetch_one("SELECT id FROM dim_tables WHERE code = ?", (body.code,))
+    if existing:
+        raise HTTPException(status_code=400, detail="维表编码已存在")
+    ts = now_ms()
+    cur = execute(
+        "INSERT INTO dim_tables (code, name, description, sort_order, created_at, updated_at, updated_by) "
+        "VALUES (?, ?, ?, 0, ?, ?, ?)",
+        (body.code, body.name, body.description, ts, ts, admin.get("username") or "admin"),
+    )
+    row = fetch_one("SELECT * FROM dim_tables WHERE id = ?", (cur,))
+    return _dim_table_out(row)
+
+
+@router.put("/dim-tables/{table_id}")
+def update_dim_table(table_id: int, body: DimTableUpdate, admin: dict = Depends(require_settings_admin)):
+    row = fetch_one("SELECT id FROM dim_tables WHERE id = ?", (table_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="维表不存在")
+    updates: list[str] = []
+    params: list = []
+    if body.name is not None:
+        updates.append("name = ?")
+        params.append(body.name)
+    if body.description is not None:
+        updates.append("description = ?")
+        params.append(body.description)
+    if body.sort_order is not None:
+        updates.append("sort_order = ?")
+        params.append(body.sort_order)
+    if updates:
+        updates.append("updated_at = ?")
+        params.append(now_ms())
+        updates.append("updated_by = ?")
+        params.append(admin.get("username") or "admin")
+        params.append(table_id)
+        execute(f"UPDATE dim_tables SET {', '.join(updates)} WHERE id = ?", params)
+    return {"ok": True}
+
+
+@router.delete("/dim-tables/{table_id}")
+def delete_dim_table(table_id: int, admin: dict = Depends(require_settings_admin)):
+    row = fetch_one("SELECT id FROM dim_tables WHERE id = ?", (table_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="维表不存在")
+    execute("DELETE FROM dim_tables WHERE id = ?", (table_id,))
+    return {"ok": True}
+
+
+@router.get("/dim-tables/{table_id}/values")
+def list_dim_values(
+    table_id: int,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str = "",
+    enabled: str = "",
+    sort: str = "",
+    order: str = "asc",
+    admin: dict = Depends(require_settings_admin),
+):
+    table = fetch_one("SELECT id FROM dim_tables WHERE id = ?", (table_id,))
+    if not table:
+        raise HTTPException(status_code=404, detail="维表不存在")
+    offset = (page - 1) * page_size
+    clauses = ["table_id = ?"]
+    params: list = [table_id]
+    if search:
+        clauses.append("(code LIKE ? OR name LIKE ? OR remark LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+    if enabled:
+        clauses.append("enabled = ?")
+        params.append(1 if enabled.strip().lower() == "true" else 0)
+    where = "WHERE " + " AND ".join(clauses)
+    sort_columns = {
+        "code": "code",
+        "name": "name",
+        "sort_order": "sort_order",
+        "enabled": "enabled",
+        "remark": "remark",
+    }
+    order_by = "sort_order, id"
+    if sort in sort_columns:
+        direction = "ASC" if order.strip().lower() == "asc" else "DESC"
+        order_by = f"{sort_columns[sort]} {direction}, id"
+    total = fetch_one(f"SELECT COUNT(*) AS n FROM dim_values {where}", params)["n"]
+    rows = fetch_all(
+        f"SELECT * FROM dim_values {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
+        (*params, page_size, offset),
+    )
+    items = [DimValueOut(**dict(r)) for r in rows]
+    return DimValueList(items=items, total=total, page=page, pageSize=page_size)
+
+
+@router.post("/dim-tables/{table_id}/values")
+def create_dim_value(
+    table_id: int, body: DimValueCreate, admin: dict = Depends(require_settings_admin)
+):
+    table = fetch_one("SELECT id FROM dim_tables WHERE id = ?", (table_id,))
+    if not table:
+        raise HTTPException(status_code=404, detail="维表不存在")
+    dup = fetch_one(
+        "SELECT id FROM dim_values WHERE table_id = ? AND code = ?", (table_id, body.code)
+    )
+    if dup:
+        raise HTTPException(status_code=400, detail="该编码在当前维表已存在")
+    ts = now_ms()
+    execute(
+        "INSERT INTO dim_values (table_id, code, name, sort_order, enabled, remark, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            table_id,
+            body.code,
+            body.name,
+            body.sort_order,
+            1 if body.enabled else 0,
+            body.remark,
+            ts,
+            ts,
+        ),
+    )
+    return {"ok": True}
+
+
+@router.put("/dim-tables/{table_id}/values/{value_id}")
+def update_dim_value(
+    table_id: int,
+    value_id: int,
+    body: DimValueUpdate,
+    admin: dict = Depends(require_settings_admin),
+):
+    row = fetch_one(
+        "SELECT id FROM dim_values WHERE id = ? AND table_id = ?", (value_id, table_id)
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="维表取值不存在")
+    updates: list[str] = []
+    params: list = []
+    if body.code is not None:
+        dup = fetch_one(
+            "SELECT id FROM dim_values WHERE table_id = ? AND code = ? AND id != ?",
+            (table_id, body.code, value_id),
+        )
+        if dup:
+            raise HTTPException(status_code=400, detail="该编码在当前维表已存在")
+        updates.append("code = ?")
+        params.append(body.code)
+    if body.name is not None:
+        updates.append("name = ?")
+        params.append(body.name)
+    if body.sort_order is not None:
+        updates.append("sort_order = ?")
+        params.append(body.sort_order)
+    if body.enabled is not None:
+        updates.append("enabled = ?")
+        params.append(1 if body.enabled else 0)
+    if body.remark is not None:
+        updates.append("remark = ?")
+        params.append(body.remark)
+    if updates:
+        updates.append("updated_at = ?")
+        params.append(now_ms())
+        params.append(value_id)
+        execute(f"UPDATE dim_values SET {', '.join(updates)} WHERE id = ?", params)
+    return {"ok": True}
+
+
+@router.delete("/dim-tables/{table_id}/values/{value_id}")
+def delete_dim_value(
+    table_id: int, value_id: int, admin: dict = Depends(require_settings_admin)
+):
+    row = fetch_one(
+        "SELECT id FROM dim_values WHERE id = ? AND table_id = ?", (value_id, table_id)
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="维表取值不存在")
+    execute("DELETE FROM dim_values WHERE id = ?", (value_id,))
+    return {"ok": True}
+
+
+@router.get("/dim-tables/by-code/{code}/values")
+def list_dim_values_by_code(code: str, admin: dict = Depends(require_settings_admin)):
+    """下拉专用：返回某维表启用取值的 [{code, name}] 列表。"""
+    table = fetch_one("SELECT id FROM dim_tables WHERE code = ?", (code,))
+    if not table:
+        return []
+    rows = fetch_all(
+        "SELECT code, name FROM dim_values WHERE table_id = ? AND enabled = 1 ORDER BY sort_order, id",
+        (table["id"],),
+    )
+    return [{"code": r["code"], "name": r["name"]} for r in rows]
 
 
 # ============ 导入 / 导出记录（所有管理员可见，可下载源文件） ============

@@ -113,3 +113,65 @@ class SettingsPayload(BaseModel):
     value: str | None = None
     remark: str | None = None
     enabled: bool | None = None
+
+
+# ============ 通用维表（dim_tables / dim_values） ============
+
+
+class DimTableOut(BaseModel):
+    id: int
+    code: str
+    name: str
+    description: str
+    sort_order: int
+    value_count: int = 0
+    created_at: int | None = None
+    updated_at: int | None = None
+    updated_by: str = ""
+
+
+class DimValueOut(BaseModel):
+    id: int
+    table_id: int
+    code: str
+    name: str
+    sort_order: int
+    enabled: int
+    remark: str
+    created_at: int | None = None
+    updated_at: int | None = None
+
+
+class DimValueList(BaseModel):
+    items: list[DimValueOut]
+    total: int
+    page: int
+    pageSize: int
+
+
+class DimTableCreate(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=64)
+    description: str = ""
+
+
+class DimTableUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=64)
+    description: str | None = None
+    sort_order: int | None = None
+
+
+class DimValueCreate(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=128)
+    sort_order: int = 0
+    enabled: bool = True
+    remark: str = ""
+
+
+class DimValueUpdate(BaseModel):
+    code: str | None = Field(default=None, max_length=64)
+    name: str | None = Field(default=None, max_length=128)
+    sort_order: int | None = None
+    enabled: bool | None = None
+    remark: str | None = None
