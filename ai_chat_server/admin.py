@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import unicodedata
 
 import openpyxl
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
@@ -51,6 +52,175 @@ _PERIODS: dict[str, int] = {
     "month": 30 * _DAY_MS,
     "year": 365 * _DAY_MS,
 }
+
+
+# ============ 导入导出：语言判定与表头本地化 ============
+# 前端通过 Accept-Language 传入当前界面语言（zh-CN / en-US），后端据此决定
+# 「导出表头 / 模板表头 / 导入错误提示」的语言。导入解析则反向做中英文双向兼容，
+# 无论界面是哪种语言，中英文表头的文件都能导入（只关心数据行）。
+
+
+def _is_en(request: Request | None) -> bool:
+    """按 Accept-Language 判定是否英文环境。取第一个语言标签的主语言（en-US → en）。"""
+    if request is None:
+        return False
+    raw = (request.headers.get("accept-language") or "").lower()
+    for part in raw.split(","):
+        tag = part.split(";")[0].strip()
+        if tag:
+            return tag.split("-")[0] == "en"
+    return False
+
+
+def _t(zh: str, en: str, is_en: bool) -> str:
+    """按请求语言取文案（默认中文）。"""
+    return en if is_en else zh
+
+
+def _make_row_fail(errors: list[str], row_errors: dict[int, str], is_en: bool):
+    """构造行错误记录器：errors 供接口返回（带行号），row_errors 回写到 Excel 标注列。
+
+    三个导入接口共用，保证「界面语言」与「返回的错误文案」一致。"""
+
+    def row_fail(n: int, zh: str, en: str) -> None:
+        reason = _t(zh, en, is_en)
+        errors.append(f"Row {n}: {reason}" if is_en else f"第 {n} 行：{reason}")
+        row_errors[n] = reason
+
+    return row_fail
+
+
+def _missing_col(key: str, is_en: bool) -> str:
+    """缺列提示：中文用本地化表头名，英文用「字段名 column」的英文语序。"""
+    label = _HEADER_LABELS.get(key)
+    if not label:
+        return f"xlsx is missing the {key} column" if is_en else f"xlsx 缺少 {key} 列"
+    return (
+        f"xlsx is missing the {label[1]} column" if is_en else f"xlsx 缺少「{label[0]}」列"
+    )
+
+
+def _norm_header(v) -> str:
+    """表头归一化：全角转半角 → 去括号补充说明 → 去空白 → 小写 → 去尾部冒号。
+    让「模型标识」「Model Key」「model_key」「MODEL_KEY」等写法都能落到同一个 key。"""
+    s = "" if v is None else str(v)
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"\([^)]*\)", "", s)  # 去「名称（必填）」这类补充说明
+    return s.strip().lower().rstrip(":：").strip()
+
+
+# 各模块导出/模板表头：字段名 → (中文, 英文)
+_MODEL_HEADERS: dict[str, tuple[str, str]] = {
+    "model_key": ("模型标识", "Model Key"),
+    "name": ("名称", "Name"),
+    "name_en": ("英文名称", "English Name"),
+    "provider": ("提供商", "Provider"),
+    "free": ("免费", "Free"),
+    "vision": ("视觉", "Vision"),
+    "supports_search": ("联网", "Web Search"),
+    "enabled": ("启用", "Enabled"),
+    "sort_order": ("排序", "Sort"),
+    "is_default": ("默认", "Default"),
+}
+
+_USER_HEADERS: dict[str, tuple[str, str]] = {
+    "username": ("用户名", "Username"),
+    "role": ("角色", "Role"),
+    "is_active": ("启用", "Enabled"),
+    "birthday": ("生日", "Birthday"),
+    "gender": ("性别", "Gender"),
+    "province": ("省份", "Province"),
+    "city": ("城市", "City"),
+    "district": ("区县", "District"),
+    "logins": ("登录次数", "Logins"),
+    "total_tokens": ("总 Token", "Total Tokens"),
+    "last_seen_at": ("最后活跃", "Last Seen"),
+    "created_at": ("注册时间", "Created"),
+    "updated_at": ("最后更新时间", "Last Updated"),
+    "updated_by": ("最后更新人", "Updated By"),
+}
+
+_SETTING_HEADERS: dict[str, tuple[str, str]] = {
+    "key": ("键", "Key"),
+    "value": ("值", "Value"),
+    "remark": ("备注", "Remark"),
+    "enabled": ("启用", "Enabled"),
+}
+
+_DIM_HEADERS: dict[str, tuple[str, str]] = {
+    "code": ("编码", "Code"),
+    "name": ("名称", "Name"),
+    "name_en": ("英文名称", "English Name"),
+    "api_key": ("API密钥", "API Key"),
+    "sort_order": ("排序", "Sort"),
+    "enabled": ("启用", "Enabled"),
+    "remark": ("备注", "Remark"),
+}
+
+
+# 字段名 → (中文, 英文) 汇总表，供缺列等错误提示按字段名取本地化措辞
+_HEADER_LABELS: dict[str, tuple[str, str]] = {
+    **_MODEL_HEADERS,
+    **_SETTING_HEADERS,
+    **_DIM_HEADERS,
+    **_USER_HEADERS,
+}
+
+
+def _localized_headers(
+    keys: list[str], table: dict[str, tuple[str, str]], is_en: bool
+) -> list[str]:
+    """按语言生成表头行：英文环境取英文，中文环境取中文，字典未覆盖时回退字段名。"""
+    return [table.get(k, (k, k))[1 if is_en else 0] for k in keys]
+
+
+def _build_header_aliases() -> dict[str, str]:
+    """汇总「中英文表头 → 规范字段名」映射，供导入时把任意语言的表头翻译回字段 key。
+    同时登记字段 key 本身与英文表头的下划线变体（Model Key → model_key）。"""
+    aliases: dict[str, str] = {}
+    for table in (_MODEL_HEADERS, _USER_HEADERS, _SETTING_HEADERS, _DIM_HEADERS):
+        for key, (zh, en) in table.items():
+            for label in (zh, en, key):
+                n = _norm_header(label)
+                if n:
+                    aliases[n] = key
+                # 空格/连字符变体：Model Key → model_key
+                u = n.replace(" ", "_").replace("-", "_")
+                if u:
+                    aliases[u] = key
+    return aliases
+
+
+_HEADER_ALIASES: dict[str, str] = _build_header_aliases()
+
+
+def _resolve_headers(
+    header_row, table: dict[str, tuple[str, str]] | None = None
+) -> list[str]:
+    """把表头行解析为规范字段名：英文 key 直通，中文表头经别名表翻译，未识别的原样保留。
+    这样中文界面导出的中文表头文件、英文界面导出的英文表头文件可以互相导入。
+
+    table 为所属模块的表头字典，优先按本模块翻译 —— 不同模块可能有同名表头
+    （如用户导出的「启用」是 is_active，而模型/维表的「启用」是 enabled），
+    只查全局别名表会被后写入的模块覆盖而串列。"""
+    local: dict[str, str] = {}
+    if table:
+        for key, (zh, en) in table.items():
+            for label in (zh, en, key):
+                n = _norm_header(label)
+                for v in (n, n.replace(" ", "_").replace("-", "_")):
+                    if v:
+                        local[v] = key
+    out: list[str] = []
+    for h in header_row or []:
+        s = _norm_header(h)
+        if not s:
+            out.append("")
+            continue
+        u = s.replace(" ", "_").replace("-", "_")
+        key = local.get(s) or local.get(u) or _HEADER_ALIASES.get(s) or _HEADER_ALIASES.get(u)
+        out.append(key if key else s)
+    return out
 
 
 @router.get("/stats")
@@ -330,6 +500,7 @@ _USER_FIELDS = [
 # 注意：必须注册在 /users/{user_id} 之前，否则 "export" 会被 {user_id} 路由拦截（int 解析失败 → 422）
 @router.get("/users/export")
 def export_users(
+    request: Request,
     search: str = "",
     username: str = "",
     gender: str = "",
@@ -341,7 +512,9 @@ def export_users(
     admin: dict = Depends(require_super_admin),
 ):
     """导出用户为 xlsx。scope=filtered 按当前筛选与排序导出，scope=all 导出全部。
+    表头按 Accept-Language 输出中文/英文。
     导出产物落盘保存（快照语义），超期按 export_file_retention_hours 清理、记录保留。"""
+    is_en = _is_en(request)
     uname = admin.get("username") or "admin"
     where, params, order_by = _users_where_sort(
         search=search, username=username, gender=gender, role=role,
@@ -352,7 +525,7 @@ def export_users(
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "users"
-        ws.append(_USER_FIELDS)
+        ws.append(_localized_headers(_USER_FIELDS, _USER_HEADERS, is_en))
         for r in rows:
             ws.append(["" if r[f] is None else r[f] for f in _USER_FIELDS])
         buf = io.BytesIO()
@@ -866,12 +1039,17 @@ def _write_transfer_meta(
     )
 
 
-def _build_annotated_file(raw: bytes, row_errors: dict, filename: str) -> tuple[str, int]:
-    """基于导入源文件生成带「错误分析」列的 xlsx：表头红底白字，错误行单元格黄底。返回 (path, size)。"""
+def _build_annotated_file(
+    raw: bytes, row_errors: dict, filename: str, is_en: bool = False
+) -> tuple[str, int]:
+    """基于导入源文件生成带「错误分析」列的 xlsx：表头红底白字，错误行单元格黄底。
+    新增列的列头按导入时的界面语言输出。返回 (path, size)。"""
     wb = openpyxl.load_workbook(io.BytesIO(raw))
     ws = wb.active
     err_col = ws.max_column + 1
-    header_cell = ws.cell(row=1, column=err_col, value="错误分析")
+    header_cell = ws.cell(
+        row=1, column=err_col, value=_t("错误分析", "Error Analysis", is_en)
+    )
     header_cell.fill = PatternFill(fill_type="solid", start_color="C00000", end_color="C00000")
     header_cell.font = Font(color="FFFFFF", bold=True)
     yellow = PatternFill(fill_type="solid", start_color="FFEB9C", end_color="FFEB9C")
@@ -886,6 +1064,7 @@ def _build_annotated_file(raw: bytes, row_errors: dict, filename: str) -> tuple[
 
 @router.get("/models/export")
 def export_models(
+    request: Request,
     search: str = "",
     name: str = "",
     model_key: str = "",
@@ -900,7 +1079,9 @@ def export_models(
     admin: dict = Depends(require_model_admin),
 ):
     """导出模型为 xlsx。scope=filtered 按当前筛选与排序导出，scope=all 导出全部。
+    表头按 Accept-Language 输出中文/英文。
     导出产物落盘保存（快照语义），超期按 export_file_retention_hours 清理、记录保留。"""
+    is_en = _is_en(request)
     username = admin.get("username") or "admin"
     where, params, order_by = _models_where_sort(
         search=search,
@@ -919,7 +1100,7 @@ def export_models(
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "models"
-        ws.append(_MODEL_FIELDS)
+        ws.append(_localized_headers(_MODEL_FIELDS, _MODEL_HEADERS, is_en))
         for r in rows:
             ws.append(["" if r[f] is None else r[f] for f in _MODEL_FIELDS])
         buf = io.BytesIO()
@@ -964,12 +1145,12 @@ def _known_provider_ids() -> list[str]:
 @router.get("/models/template")
 def download_model_template(request: Request, admin: dict = Depends(require_model_admin)):
     """下载模型导入模板：表头 + 示例行 + 枚举列下拉校验（provider / 布尔列）。
-    按 Accept-Language 本地化：英文状态下载英文模板（示例值与校验文案）。"""
-    is_en = "en" in (request.headers.get("accept-language") or "").lower()
+    按 Accept-Language 本地化：表头、示例值与校验文案跟随当前界面语言。"""
+    is_en = _is_en(request)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "models"
-    ws.append(_MODEL_FIELDS)
+    ws.append(_localized_headers(_MODEL_FIELDS, _MODEL_HEADERS, is_en))
     # 示例行：与导入解析逻辑对齐（布尔列「是/否」或 yes/no，_parse_bool 均可解析）
     if is_en:
         ws.append(["example/model-key", "Model Name (Chinese)", "Example Model Name", "openai", "yes", "no", "yes", "yes", 100, "no"])
@@ -1040,8 +1221,15 @@ def _has_chinese(s: str) -> bool:
 
 
 @router.post("/models/import")
-async def import_models(file: UploadFile = File(...), admin: dict = Depends(require_model_admin)):
-    """从 xlsx（Excel 表格）批量导入模型：model_key 已存在则更新，否则新增。"""
+async def import_models(
+    request: Request,
+    file: UploadFile = File(...),
+    admin: dict = Depends(require_model_admin),
+):
+    """从 xlsx（Excel 表格）批量导入模型：model_key 已存在则更新，否则新增。
+    表头中英文通吃：中文界面导出的中文表头、英文界面导出的英文表头都能识别，
+    与当前界面语言无关（只关心数据行）。"""
+    is_en = _is_en(request)
     raw = await file.read()
     original_name = file.filename or "models_import.xlsx"
     username = admin.get("username") or "admin"
@@ -1051,7 +1239,9 @@ async def import_models(file: UploadFile = File(...), admin: dict = Depends(requ
             "import", username, original_name, len(raw), _XLSX_MIME,
             remark="模型数据导入：文件过大（上限 10MB）", status="failed",
         )
-        raise HTTPException(status_code=400, detail="文件过大（上限 10MB）")
+        raise HTTPException(
+            status_code=400, detail=_t("文件过大（上限 10MB）", "File too large (max 10MB)", is_en)
+        )
 
     # 先落盘源文件并写导入记录（无论后续解析是否成功，都保留导入痕迹）
     saved_path, record_id = _write_transfer_record(
@@ -1069,7 +1259,14 @@ async def import_models(file: UploadFile = File(...), admin: dict = Depends(requ
         wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
     except Exception:
         _mark_failed("无法解析文件")
-        raise HTTPException(status_code=400, detail="无法解析文件，请上传有效的 .xlsx 文件")
+        raise HTTPException(
+            status_code=400,
+            detail=_t(
+                "无法解析文件，请上传有效的 .xlsx 文件",
+                "Cannot parse the file, please upload a valid .xlsx file",
+                is_en,
+            ),
+        )
 
     ws = wb.active
     rows_iter = ws.iter_rows(values_only=True)
@@ -1077,16 +1274,16 @@ async def import_models(file: UploadFile = File(...), admin: dict = Depends(requ
         header_row = next(rows_iter)
     except StopIteration:
         _mark_failed("空文件")
-        raise HTTPException(status_code=400, detail="空文件")
+        raise HTTPException(status_code=400, detail=_t("空文件", "Empty file", is_en))
 
-    # 表头兼容：去空格、小写
-    header = [str(h).strip().lower() if h is not None else "" for h in header_row]
+    # 表头中英文双向兼容：中文表头经别名表翻译成字段 key，英文 key 直通
+    header = _resolve_headers(header_row, _MODEL_HEADERS)
     if "model_key" not in header:
         _mark_failed("缺少 model_key 列")
-        raise HTTPException(status_code=400, detail="xlsx 缺少 model_key 列")
+        raise HTTPException(status_code=400, detail=_missing_col("model_key", is_en))
     if "name" not in header:
         _mark_failed("缺少 name 列")
-        raise HTTPException(status_code=400, detail="xlsx 缺少 name 列")
+        raise HTTPException(status_code=400, detail=_missing_col("name", is_en))
 
     idx = {h: i for i, h in enumerate(header)}
     def cell(row, key: str, default=""):
@@ -1100,6 +1297,7 @@ async def import_models(file: UploadFile = File(...), admin: dict = Depends(requ
     updated = 0
     errors: list[str] = []
     row_errors: dict[int, str] = {}
+    row_fail = _make_row_fail(errors, row_errors, is_en)
     known_providers = set(_known_provider_ids())
     seen_names: set[str] = set()
     seen_names_en: set[str] = set()
@@ -1109,43 +1307,31 @@ async def import_models(file: UploadFile = File(...), admin: dict = Depends(requ
         model_key = cell(row, "model_key")
         name = cell(row, "name")
         if not model_key or not name:
-            reason = "model_key/name 不能为空"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "model_key/name 不能为空", "model_key/name cannot be empty")
             continue
         name_en = cell(row, "name_en")
         if len(name_en) > 100:
-            reason = "name_en 长度超限（100）"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "name_en 长度超限（100）", "name_en exceeds the max length (100)")
             continue
         if name_en and _has_chinese(name_en):
-            reason = "name_en 不能包含中文"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "name_en 不能包含中文", "name_en must not contain Chinese characters")
             continue
         provider = cell(row, "provider", "openai") or "openai"
         if provider not in known_providers:
-            reason = "provider 不在数据字典"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "provider 不在数据字典", "provider is not in the dimension table")
             continue
         exists = fetch_one(
             "SELECT id FROM models WHERE provider = ? AND model_key = ?", (provider, model_key)
         )
         dup_name = fetch_one("SELECT id FROM models WHERE name = ?", (name,))
         if (dup_name and (not exists or dup_name["id"] != exists["id"])) or name in seen_names:
-            reason = "模型名称已存在"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "模型名称已存在", "Model name already exists")
             continue
         dup_name_en = None
         if name_en:
             dup_name_en = fetch_one("SELECT id FROM models WHERE name_en = ? AND name_en <> ''", (name_en,))
         if (dup_name_en and (not exists or dup_name_en["id"] != exists["id"])) or name_en in seen_names_en:
-            reason = "英文名称已存在"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "英文名称已存在", "English name already exists")
             continue
         try:
             sort_order = int(float(cell(row, "sort_order", "0") or "0"))
@@ -1192,7 +1378,7 @@ async def import_models(file: UploadFile = File(...), admin: dict = Depends(requ
     # 失败/部分成功：下载产物替换为带「错误分析」列的标注文件（含全部源数据，是源文件的超集）
     if row_errors:
         try:
-            ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name)
+            ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name, is_en)
             if os.path.isfile(saved_path):
                 os.remove(saved_path)
             execute(
@@ -1560,6 +1746,7 @@ _SETTING_FIELDS = ["key", "value", "remark", "enabled"]
 
 @router.get("/settings/export")
 def export_settings(
+    request: Request,
     search: str = "",
     enabled: str = "",
     sort: str = "",
@@ -1568,7 +1755,9 @@ def export_settings(
     admin: dict = Depends(require_settings_admin),
 ):
     """导出配置项为 xlsx。scope=filtered 按当前筛选与排序导出，scope=all 导出全部。
+    表头按 Accept-Language 输出中文/英文。
     导出产物落盘保存（快照语义），超期按 export_file_retention_hours 清理、记录保留。"""
+    is_en = _is_en(request)
     username = admin.get("username") or "admin"
     where, params, order_by = _settings_where_sort(
         search=search, enabled=enabled, sort=sort, order=order
@@ -1578,7 +1767,7 @@ def export_settings(
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "settings"
-        ws.append(_SETTING_FIELDS)
+        ws.append(_localized_headers(_SETTING_FIELDS, _SETTING_HEADERS, is_en))
         for r in rows:
             ws.append(
                 [
@@ -1611,12 +1800,12 @@ def export_settings(
 
 @router.get("/settings/template")
 def download_settings_template(request: Request, admin: dict = Depends(require_settings_admin)):
-    """下载配置项导入模板：英文字段表头 + 本地化示例行 + enabled 布尔下拉。"""
-    is_en = "en" in (request.headers.get("accept-language") or "").lower()
+    """下载配置项导入模板：本地化表头 + 本地化示例行 + enabled 布尔下拉。"""
+    is_en = _is_en(request)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "settings"
-    ws.append(_SETTING_FIELDS)
+    ws.append(_localized_headers(_SETTING_FIELDS, _SETTING_HEADERS, is_en))
     ws.append(["example_key", "example value", "example remark", "yes"] if is_en
                else ["example_key", "示例值", "示例说明", "是"])
     dv = DataValidation(
@@ -1633,8 +1822,14 @@ def download_settings_template(request: Request, admin: dict = Depends(require_s
 
 
 @router.post("/settings/import")
-async def import_settings(file: UploadFile = File(...), admin: dict = Depends(require_settings_admin)):
-    """从 xlsx 批量导入配置项：key 已存在则更新，否则新增。"""
+async def import_settings(
+    request: Request,
+    file: UploadFile = File(...),
+    admin: dict = Depends(require_settings_admin),
+):
+    """从 xlsx 批量导入配置项：key 已存在则更新，否则新增。
+    表头中英文通吃，与当前界面语言无关（只关心数据行）。"""
+    is_en = _is_en(request)
     raw = await file.read()
     original_name = file.filename or "settings_import.xlsx"
     username = admin.get("username") or "admin"
@@ -1643,7 +1838,9 @@ async def import_settings(file: UploadFile = File(...), admin: dict = Depends(re
             "import", username, original_name, len(raw), _XLSX_MIME,
             remark="配置数据导入：文件过大（上限 10MB）", status="failed",
         )
-        raise HTTPException(status_code=400, detail="文件过大（上限 10MB）")
+        raise HTTPException(
+            status_code=400, detail=_t("文件过大（上限 10MB）", "File too large (max 10MB)", is_en)
+        )
 
     saved_path, record_id = _write_transfer_record(
         "import", username, original_name, raw, _XLSX_MIME,
@@ -1660,7 +1857,14 @@ async def import_settings(file: UploadFile = File(...), admin: dict = Depends(re
         wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
     except Exception:
         _mark_failed("无法解析文件")
-        raise HTTPException(status_code=400, detail="无法解析文件，请上传有效的 .xlsx 文件")
+        raise HTTPException(
+            status_code=400,
+            detail=_t(
+                "无法解析文件，请上传有效的 .xlsx 文件",
+                "Cannot parse the file, please upload a valid .xlsx file",
+                is_en,
+            ),
+        )
 
     ws = wb.active
     rows_iter = ws.iter_rows(values_only=True)
@@ -1668,12 +1872,13 @@ async def import_settings(file: UploadFile = File(...), admin: dict = Depends(re
         header_row = next(rows_iter)
     except StopIteration:
         _mark_failed("空文件")
-        raise HTTPException(status_code=400, detail="空文件")
+        raise HTTPException(status_code=400, detail=_t("空文件", "Empty file", is_en))
 
-    header = [str(h).strip().lower() if h is not None else "" for h in header_row]
+    # 表头中英文双向兼容：中文表头经别名表翻译成字段 key，英文 key 直通
+    header = _resolve_headers(header_row, _SETTING_HEADERS)
     if "key" not in header:
         _mark_failed("缺少 key 列")
-        raise HTTPException(status_code=400, detail="xlsx 缺少 key 列")
+        raise HTTPException(status_code=400, detail=_missing_col("key", is_en))
 
     idx = {h: i for i, h in enumerate(header)}
 
@@ -1687,6 +1892,7 @@ async def import_settings(file: UploadFile = File(...), admin: dict = Depends(re
     updated = 0
     errors: list[str] = []
     row_errors: dict[int, str] = {}
+    row_fail = _make_row_fail(errors, row_errors, is_en)
     seen_keys: set[str] = set()
 
     for n, row in enumerate(rows_iter, start=2):
@@ -1694,38 +1900,27 @@ async def import_settings(file: UploadFile = File(...), admin: dict = Depends(re
             continue
         key = str(cell(row, "key", "")).strip()
         if not key:
-            reason = "key 不能为空"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "key 不能为空", "key cannot be empty")
             continue
         if not (1 <= len(key) < 64) or not _SETTING_KEY_RE.match(key):
-            reason = "key 格式非法（仅英文字母/下划线，长度 1-63）"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "key 格式非法（仅英文字母/下划线，长度 1-63）", "Invalid key format (letters and underscore only, length 1-63)")
             continue
         if key in seen_keys:
-            reason = f"文件内键名重复：{key}"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, f"文件内键名重复：{key}", f"Duplicate key in file: {key}")
             continue
         value = str(cell(row, "value", "") or "")
         remark = str(cell(row, "remark", "") or "")
         if len(value) >= 5000:
-            reason = "value 长度超限（5000）"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "value 长度超限（5000）", "value exceeds the max length (5000)")
             continue
         if len(remark) > 255:
-            reason = "remark 长度超限（255）"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "remark 长度超限（255）", "remark exceeds the max length (255)")
             continue
         enabled = _parse_bool(cell(row, "enabled", "1"))
 
-        bad_value = validate_setting_value(key, value)
+        bad_value = validate_setting_value(key, value, is_en)
         if bad_value:
-            errors.append(f"第 {n} 行：{bad_value}")
-            row_errors[n] = bad_value
+            row_fail(n, bad_value, bad_value)
             continue
 
         exists = fetch_one("SELECT key FROM settings WHERE key = ?", (key,))
@@ -1754,7 +1949,7 @@ async def import_settings(file: UploadFile = File(...), admin: dict = Depends(re
 
     if row_errors:
         try:
-            ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name)
+            ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name, is_en)
             if os.path.isfile(saved_path):
                 os.remove(saved_path)
             execute(
@@ -1777,7 +1972,7 @@ def list_setting_logs(
     admin: dict = Depends(require_settings_admin),
 ):
     offset = (page - 1) * page_size
-    is_en = "en" in (request.headers.get("accept-language") or "").lower()
+    is_en = _is_en(request)
     total = fetch_one(
         "SELECT COUNT(*) AS n FROM setting_logs WHERE setting_key = ?", (key,)
     )["n"]
@@ -1805,7 +2000,7 @@ def list_operation_logs(
     """通用操作日志：按实体类型 + 实体 id 分页查询（模型/维表取值/用户共用）。
     content 按 Accept-Language 返回中文或英文。"""
     offset = (page - 1) * page_size
-    is_en = "en" in (request.headers.get("accept-language") or "").lower()
+    is_en = _is_en(request)
     total = fetch_one(
         "SELECT COUNT(*) AS n FROM admin_operation_logs WHERE entity = ? AND entity_id = ?",
         (entity, entity_id),
@@ -2052,15 +2247,20 @@ def _provider_needs_key(code: str | None) -> bool:
 
 
 def _validate_provider_enable(
-    table_id: int, code: str | None, api_key: str | None, enabled: bool
+    table_id: int, code: str | None, api_key: str | None, enabled: bool, is_en: bool = False
 ) -> str | None:
-    """模型供应商维表：要启用（enabled=True）必须已配置真实 api_key（ollama 豁免）。返回错误文案或 None。"""
+    """模型供应商维表：要启用（enabled=True）必须已配置真实 api_key（ollama 豁免）。
+    返回按 is_en 本地化的错误文案或 None（is_en 默认 False，兼容表单类调用方）。"""
     if not _is_model_provider_table(table_id):
         return None
     if not enabled or not _provider_needs_key(code):
         return None
     if not (api_key or "").strip() or _is_masked_secret(api_key):
-        return "API 密钥是启用提供商的必要条件，请先填写 API 密钥"
+        return _t(
+            "API 密钥是启用提供商的必要条件，请先填写 API 密钥",
+            "An API key is required to enable this provider; please fill it in first",
+            is_en,
+        )
     return None
 
 
@@ -2234,7 +2434,7 @@ def list_dim_values_by_code(
     code: str, request: Request, admin: dict = Depends(require_settings_admin)
 ):
     """下拉专用：返回某维表启用取值的 [{code, name}]，name 按 Accept-Language 返回中文或英文。"""
-    is_en = "en" in (request.headers.get("accept-language") or "").lower()
+    is_en = _is_en(request)
     table = fetch_one("SELECT id FROM dim_tables WHERE code = ?", (code,))
     if not table:
         return []
@@ -2291,6 +2491,7 @@ def _dim_xlsx_response(wb: openpyxl.Workbook, filename: str) -> StreamingRespons
 @router.get("/dim-tables/{table_id}/export")
 def export_dim_values(
     table_id: int,
+    request: Request,
     search: str = "",
     enabled: str = "",
     sort: str = "",
@@ -2299,8 +2500,10 @@ def export_dim_values(
     admin: dict = Depends(require_settings_admin),
 ):
     """导出维表取值为 xlsx。scope=filtered 按当前筛选与排序导出，scope=all 导出全部；
+    表头按 Accept-Language 输出中文/英文；
     非 super/system 管理员导出时 api_key 同样脱敏。产物落盘保存（快照语义），
     超期按 export_file_retention_hours 清理、记录保留。"""
+    is_en = _is_en(request)
     table = _dim_table_or_404(table_id)
     spec = _dim_value_field_spec(table["code"])
     keys = [f["key"] for f in spec]
@@ -2318,7 +2521,7 @@ def export_dim_values(
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "values"
-        ws.append(keys)
+        ws.append(_localized_headers(keys, _DIM_HEADERS, is_en))
         for r in rows:
             vals = []
             for k in keys:
@@ -2354,9 +2557,9 @@ def export_dim_values(
 def download_dim_template(
     table_id: int, request: Request, admin: dict = Depends(require_settings_admin)
 ):
-    """下载维表取值导入模板：英文字段表头 + 本地化示例行 + enabled 布尔下拉。"""
+    """下载维表取值导入模板：本地化表头 + 本地化示例行 + enabled 布尔下拉。"""
     table = _dim_table_or_404(table_id)
-    is_en = "en" in (request.headers.get("accept-language") or "").lower()
+    is_en = _is_en(request)
     spec = _dim_value_field_spec(table["code"])
     keys = [f["key"] for f in spec]
     is_provider = table["code"] == "model_provider"
@@ -2364,7 +2567,7 @@ def download_dim_template(
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "values"
-    ws.append(keys)
+    ws.append(_localized_headers(keys, _DIM_HEADERS, is_en))
     if is_provider:
         example = (
             ["example_code", "Example Name", "Example EN Name", "sk-xxxx", 0, "yes", ""]
@@ -2398,9 +2601,14 @@ def download_dim_template(
 
 @router.post("/dim-tables/{table_id}/import")
 async def import_dim_values(
-    table_id: int, file: UploadFile = File(...), admin: dict = Depends(require_settings_admin)
+    table_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    admin: dict = Depends(require_settings_admin),
 ):
-    """从 xlsx 批量导入维表取值：同表 code 已存在则更新，否则新增。列与校验由字段规格驱动。"""
+    """从 xlsx 批量导入维表取值：同表 code 已存在则更新，否则新增。列与校验由字段规格驱动。
+    表头中英文通吃，与当前界面语言无关（只关心数据行）。"""
+    is_en = _is_en(request)
     table = _dim_table_or_404(table_id)
     spec = _dim_value_field_spec(table["code"])
     spec_by_key = {f["key"]: f for f in spec}
@@ -2414,7 +2622,9 @@ async def import_dim_values(
             "import", username, original_name, len(raw), _XLSX_MIME,
             remark=f"维表「{table['name']}」导入：文件过大（上限 10MB）", status="failed",
         )
-        raise HTTPException(status_code=400, detail="文件过大（上限 10MB）")
+        raise HTTPException(
+            status_code=400, detail=_t("文件过大（上限 10MB）", "File too large (max 10MB)", is_en)
+        )
 
     saved_path, record_id = _write_transfer_record(
         "import", username, original_name, raw, _XLSX_MIME,
@@ -2431,7 +2641,14 @@ async def import_dim_values(
         wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
     except Exception:
         _mark_failed("无法解析文件")
-        raise HTTPException(status_code=400, detail="无法解析文件，请上传有效的 .xlsx 文件")
+        raise HTTPException(
+            status_code=400,
+            detail=_t(
+                "无法解析文件，请上传有效的 .xlsx 文件",
+                "Cannot parse the file, please upload a valid .xlsx file",
+                is_en,
+            ),
+        )
 
     ws = wb.active
     rows_iter = ws.iter_rows(values_only=True)
@@ -2439,13 +2656,14 @@ async def import_dim_values(
         header_row = next(rows_iter)
     except StopIteration:
         _mark_failed("空文件")
-        raise HTTPException(status_code=400, detail="空文件")
+        raise HTTPException(status_code=400, detail=_t("空文件", "Empty file", is_en))
 
-    header = [str(h).strip().lower() if h is not None else "" for h in header_row]
+    # 表头中英文双向兼容：中文表头经别名表翻译成字段 key，英文 key 直通
+    header = _resolve_headers(header_row, _DIM_HEADERS)
     for must in ("code", "name"):
         if must not in header:
             _mark_failed(f"缺少 {must} 列")
-            raise HTTPException(status_code=400, detail=f"xlsx 缺少 {must} 列")
+            raise HTTPException(status_code=400, detail=_missing_col(must, is_en))
     # 只识别规格内、且表头里存在的列
     idx = {h: i for i, h in enumerate(header)}
     active_keys = [k for k in keys if k in idx]
@@ -2460,6 +2678,7 @@ async def import_dim_values(
     updated = 0
     errors: list[str] = []
     row_errors: dict[int, str] = {}
+    row_fail = _make_row_fail(errors, row_errors, is_en)
     seen_codes: set[str] = set()
 
     for n, row in enumerate(rows_iter, start=2):
@@ -2468,21 +2687,18 @@ async def import_dim_values(
         code = str(cell(row, "code", "")).strip()
         name = str(cell(row, "name", "")).strip()
         if not code or not name:
-            reason = "code/name 不能为空"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, "code/name 不能为空", "code/name cannot be empty")
             continue
         if code in seen_codes:
-            reason = f"文件内编码重复：{code}"
-            errors.append(f"第 {n} 行：{reason}")
-            row_errors[n] = reason
+            row_fail(n, f"文件内编码重复：{code}", f"Duplicate code in file: {code}")
             continue
 
         # 按规格逐列解析 + 校验
         values: dict[str, object] = {"code": code, "name": name}
-        bad = None
+        bad: tuple[str, str] | None = None  # (中文, 英文) 双语错误，交给 row_fail 按语言取用
         for k in active_keys:
             f = spec_by_key[k]
+            label_zh, label_en = _HEADER_LABELS.get(k, (k, k))
             raw_v = cell(row, k, "" if not f.get("is_bool") and not f.get("is_int") else 0)
             if f.get("is_bool"):
                 values[k] = _parse_bool(raw_v)
@@ -2494,28 +2710,32 @@ async def import_dim_values(
             else:
                 sval = str(raw_v or "").strip()
                 if f.get("required") and not sval:
-                    bad = f"{k} 不能为空"
+                    bad = (f"{label_zh} 不能为空", f"{label_en} is required")
                     break
                 if f.get("max_len") and len(sval) > f["max_len"]:
-                    bad = f"{k} 长度超限（{f['max_len']}）"
+                    bad = (
+                        f"{label_zh} 长度超限（{f['max_len']}）",
+                        f"{label_en} exceeds the max length ({f['max_len']})",
+                    )
                     break
                 if f.get("no_cjk") and _CJK_RE.search(sval):
-                    bad = f"{k} 不允许包含中文"
+                    bad = (
+                        f"{label_zh} 不允许包含中文",
+                        f"{label_en} must not contain Chinese characters",
+                    )
                     break
                 values[k] = sval
         if bad:
-            errors.append(f"第 {n} 行：{bad}")
-            row_errors[n] = bad
+            row_fail(n, bad[0], bad[1])
             continue
 
         # 启用校验：模型供应商（ollama 豁免）要启用必须带 api_key
         row_enabled = bool(values.get("enabled", 1))
         enable_bad = _validate_provider_enable(
-            table_id, code, str(values.get("api_key", "")), row_enabled
+            table_id, code, str(values.get("api_key", "")), row_enabled, is_en
         )
         if enable_bad:
-            errors.append(f"第 {n} 行：{enable_bad}")
-            row_errors[n] = enable_bad
+            row_fail(n, enable_bad, enable_bad)
             continue
 
         exists = fetch_one(
@@ -2546,7 +2766,7 @@ async def import_dim_values(
 
     if row_errors:
         try:
-            ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name)
+            ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name, is_en)
             if os.path.isfile(saved_path):
                 os.remove(saved_path)
             execute(
@@ -2591,16 +2811,25 @@ def get_export_retention_hours() -> int:
     return _get_retention_hours(EXPORT_RETENTION_SETTING_KEY, DEFAULT_EXPORT_RETENTION_HOURS)
 
 
-def validate_setting_value(key: str, value) -> str | None:
-    """特定 settings 键的值格式校验；合法返回 None，非法返回中文错误信息。"""
+def validate_setting_value(key: str, value, is_en: bool = False) -> str | None:
+    """特定 settings 键的值格式校验；合法返回 None，非法返回按 is_en 本地化的错误信息。
+    is_en 默认 False，兼容表单类调用方；导入接口按请求语言传入。"""
     if key == RETENTION_SETTING_KEY:
         s = str(value if value is not None else "").strip()
         if not _POSITIVE_INT_RE.fullmatch(s):
-            return "导入源文件保留时长必须为大于 0 的正整数（单位：小时）"
+            return _t(
+                "导入源文件保留时长必须为大于 0 的正整数（单位：小时）",
+                "Import file retention must be a positive integer (hours)",
+                is_en,
+            )
     if key == EXPORT_RETENTION_SETTING_KEY:
         s = str(value if value is not None else "").strip()
         if not _POSITIVE_INT_RE.fullmatch(s):
-            return "导出文件保留时长必须为大于 0 的正整数（单位：小时）"
+            return _t(
+                "导出文件保留时长必须为大于 0 的正整数（单位：小时）",
+                "Export file retention must be a positive integer (hours)",
+                is_en,
+            )
     return None
 
 # 过期导入源文件 / 导出产物清理：只删磁盘文件、保留数据库记录（file_path 置空作为"已清理"标记）
