@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .admin import purge_expired_import_files, router as admin_router
+from .admin import purge_expired_transfer_files, router as admin_router
 from .auth import ROLE_SUPER_ADMIN, router as auth_router
 from .chat import router as chat_router
 from .config import settings
@@ -30,9 +30,9 @@ def migrate_roles() -> None:
 async def lifespan(app: FastAPI):
     init_db()
     migrate_roles()
-    # 启动兜底：清理超过保留期的导入源文件（只删文件、保留记录），补上停机期间错过的清理
+    # 启动兜底：按各自保留期清理导入源文件与导出产物（只删文件、保留记录），补上停机期间错过的清理
     try:
-        purge_expired_import_files()
+        purge_expired_transfer_files()
     except Exception:
         pass
     yield

@@ -225,10 +225,7 @@ def overview():
     }
 
 
-@router.get("/users")
-def list_users(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
+def _users_where_sort(
     search: str = "",
     username: str = "",
     gender: str = "",
@@ -236,8 +233,8 @@ def list_users(
     is_active: str = "",
     sort: str = "",
     order: str = "desc",
-):
-    offset = (page - 1) * page_size
+) -> tuple[str, list, str]:
+    """users 筛选 + 排序构建：列表 / 条件导出 / 计数共用（where 使用 u. 前缀）。"""
     clauses: list[str] = []
     params: list = []
     if search:
@@ -260,7 +257,6 @@ def list_users(
         clauses.append("u.is_active = ?")
         params.append(1 if is_active.strip().lower() == "true" else 0)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    # 排序（字段白名单，防 SQL 注入）
     sort_columns = {
         "username": "u.username",
         "role": "u.role",
@@ -277,17 +273,48 @@ def list_users(
     if sort in sort_columns:
         direction = "ASC" if order.strip().lower() == "asc" else "DESC"
         order_by = f"{sort_columns[sort]} {direction}"
-    total = fetch_one(f"SELECT COUNT(*) AS n FROM users u {where}", params)["n"]
-    rows = fetch_all(
-        f"""
+    return where, params, order_by
+
+
+# 用户列表/导出共用查询体（不含分页）：logins / total_tokens 为聚合别名列
+_USERS_SELECT = f"""
         SELECT u.id, u.username, u.role, u.is_active, u.created_at, u.last_seen_at,
                u.province, u.city, u.district, u.age, u.birthday, u.gender,
                u.updated_at, u.updated_by,
                COALESCE((SELECT COUNT(*) FROM login_logs l WHERE l.user_id = u.id AND l.success = 1), 0) AS logins,
                COALESCE((SELECT SUM(t.total_tokens) FROM token_usage t WHERE t.user_id = u.id), 0) AS total_tokens
-        FROM users u {where} ORDER BY {order_by}
-        LIMIT ? OFFSET ?
-        """,
+        FROM users u {{where}} ORDER BY {{order_by}}
+"""
+
+_USERS_COUNT_FROM = "FROM users u {where}"
+
+
+@router.get("/users/count")
+def count_users(admin: dict = Depends(require_admin)):
+    """导出面板"全部数据量"查询：不受筛选影响的用户总数。"""
+    return {"total": fetch_one(f"SELECT COUNT(*) AS n {_USERS_COUNT_FROM.format(where='')}")["n"]}
+
+
+@router.get("/users")
+def list_users(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str = "",
+    username: str = "",
+    gender: str = "",
+    role: str = "",
+    is_active: str = "",
+    sort: str = "",
+    order: str = "desc",
+):
+    offset = (page - 1) * page_size
+    where, params, order_by = _users_where_sort(
+        search=search, username=username, gender=gender, role=role,
+        is_active=is_active, sort=sort, order=order,
+    )
+    total = fetch_one(f"SELECT COUNT(*) AS n {_USERS_COUNT_FROM.format(where=where)}", params)["n"]
+    rows = fetch_all(
+        _USERS_SELECT.format(where=where, order_by=order_by) + " LIMIT ? OFFSET ?",
         (*params, page_size, offset),
     )
     return {"items": [dict(r) for r in rows], "total": total, "page": page, "pageSize": page_size}
@@ -302,31 +329,45 @@ _USER_FIELDS = [
 
 # 注意：必须注册在 /users/{user_id} 之前，否则 "export" 会被 {user_id} 路由拦截（int 解析失败 → 422）
 @router.get("/users/export")
-def export_users(admin: dict = Depends(require_super_admin)):
-    """导出全部用户为 xlsx。导出不存产物：仅写行为记录。"""
-    username = admin.get("username") or "admin"
-    rows = fetch_all(
-        """
-        SELECT u.username, u.role, u.is_active, u.birthday, u.gender, u.province, u.city, u.district,
-               COALESCE((SELECT COUNT(*) FROM login_logs l WHERE l.user_id = u.id AND l.success = 1), 0) AS logins,
-               COALESCE((SELECT SUM(t.total_tokens) FROM token_usage t WHERE t.user_id = u.id), 0) AS total_tokens,
-               u.last_seen_at, u.created_at, u.updated_at, u.updated_by
-        FROM users u ORDER BY u.id
-        """
+def export_users(
+    search: str = "",
+    username: str = "",
+    gender: str = "",
+    role: str = "",
+    is_active: str = "",
+    sort: str = "",
+    order: str = "desc",
+    scope: str = "all",
+    admin: dict = Depends(require_super_admin),
+):
+    """导出用户为 xlsx。scope=filtered 按当前筛选与排序导出，scope=all 导出全部。
+    导出产物落盘保存（快照语义），超期按 export_file_retention_hours 清理、记录保留。"""
+    uname = admin.get("username") or "admin"
+    where, params, order_by = _users_where_sort(
+        search=search, username=username, gender=gender, role=role,
+        is_active=is_active, sort=sort, order=order,
     )
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "users"
-    ws.append(_USER_FIELDS)
-    for r in rows:
-        ws.append(["" if r[f] is None else r[f] for f in _USER_FIELDS])
-    buf = io.BytesIO()
-    wb.save(buf)
-    data = buf.getvalue()
+    try:
+        rows = fetch_all(_USERS_SELECT.format(where=where, order_by=order_by), params)
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "users"
+        ws.append(_USER_FIELDS)
+        for r in rows:
+            ws.append(["" if r[f] is None else r[f] for f in _USER_FIELDS])
+        buf = io.BytesIO()
+        wb.save(buf)
+        data = buf.getvalue()
+    except Exception as err:
+        _write_transfer_meta(
+            "export", uname, f"users_{now_ms()}.xlsx", 0, _XLSX_MIME,
+            remark=f"用户数据导出失败：{err}", status="failed",
+        )
+        raise
     filename = f"users_{now_ms()}.xlsx"
-    _write_transfer_meta(
-        "export", username, filename, len(data), _XLSX_MIME,
-        remark="用户数据导出", status="success",
+    _write_transfer_record(
+        "export", uname, filename, data, _XLSX_MIME,
+        remark=f"用户数据导出（{'当前筛选结果' if scope == 'filtered' else '全部'}）", status="success",
     )
     return StreamingResponse(
         iter([data]),
@@ -684,22 +725,19 @@ def region_stats(period: str = "month"):
     return {"period": period, "provinces": provinces, "regions": list(regions.values())}
 
 
-@router.get("/models")
-def list_models(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
+def _models_where_sort(
     search: str = "",
+    name: str = "",
+    model_key: str = "",
     enabled: str = "",
     free: str = "",
     vision: str = "",
     supports_search: str = "",
-    name: str = "",
-    model_key: str = "",
     provider: str = "",
     sort: str = "",
     order: str = "asc",
-):
-    offset = (page - 1) * page_size
+) -> tuple[str, list, str]:
+    """models 筛选 + 排序构建：列表 / 条件导出 / 计数共用，保证语义一致。"""
     clauses: list[str] = []
     params: list = []
     if search:
@@ -745,6 +783,43 @@ def list_models(
     if sort in sort_columns:
         direction = "ASC" if order.strip().lower() == "asc" else "DESC"
         order_by = f"{sort_columns[sort]} {direction}, id"
+    return where, params, order_by
+
+
+@router.get("/models/count")
+def count_models(admin: dict = Depends(require_admin)):
+    """导出面板"全部数据量"查询：不受筛选影响的模型总数。"""
+    return {"total": fetch_one("SELECT COUNT(*) AS n FROM models")["n"]}
+
+
+@router.get("/models")
+def list_models(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str = "",
+    enabled: str = "",
+    free: str = "",
+    vision: str = "",
+    supports_search: str = "",
+    name: str = "",
+    model_key: str = "",
+    provider: str = "",
+    sort: str = "",
+    order: str = "asc",
+):
+    offset = (page - 1) * page_size
+    where, params, order_by = _models_where_sort(
+        search=search,
+        name=name,
+        model_key=model_key,
+        enabled=enabled,
+        free=free,
+        vision=vision,
+        supports_search=supports_search,
+        provider=provider,
+        sort=sort,
+        order=order,
+    )
     total = fetch_one(f"SELECT COUNT(*) AS n FROM models {where}", params)["n"]
     rows = fetch_all(
         f"SELECT * FROM models {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
@@ -755,11 +830,6 @@ def list_models(
 
 # 模型可导入导出的字段顺序（与 xlsx 表头一致）
 _MODEL_FIELDS = ["model_key", "name", "name_en", "provider", "free", "vision", "supports_search", "enabled", "sort_order", "is_default"]
-
-
-def _model_rows() -> list[list]:
-    rows = fetch_all("SELECT * FROM models ORDER BY sort_order, id")
-    return [[r[f] if r[f] is not None else "" for f in _MODEL_FIELDS] for r in rows]
 
 
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -815,16 +885,43 @@ def _build_annotated_file(raw: bytes, row_errors: dict, filename: str) -> tuple[
 
 
 @router.get("/models/export")
-def export_models(admin: dict = Depends(require_model_admin)):
-    """导出全部模型为 xlsx（Excel 表格）。导出不存产物：仅写行为记录，记录页可重新生成下载。"""
+def export_models(
+    search: str = "",
+    name: str = "",
+    model_key: str = "",
+    enabled: str = "",
+    free: str = "",
+    vision: str = "",
+    supports_search: str = "",
+    provider: str = "",
+    sort: str = "",
+    order: str = "asc",
+    scope: str = "all",
+    admin: dict = Depends(require_model_admin),
+):
+    """导出模型为 xlsx。scope=filtered 按当前筛选与排序导出，scope=all 导出全部。
+    导出产物落盘保存（快照语义），超期按 export_file_retention_hours 清理、记录保留。"""
     username = admin.get("username") or "admin"
+    where, params, order_by = _models_where_sort(
+        search=search,
+        name=name,
+        model_key=model_key,
+        enabled=enabled,
+        free=free,
+        vision=vision,
+        supports_search=supports_search,
+        provider=provider,
+        sort=sort,
+        order=order,
+    )
     try:
+        rows = fetch_all(f"SELECT * FROM models {where} ORDER BY {order_by}", params)
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "models"
         ws.append(_MODEL_FIELDS)
-        for row in _model_rows():
-            ws.append(row)
+        for r in rows:
+            ws.append(["" if r[f] is None else r[f] for f in _MODEL_FIELDS])
         buf = io.BytesIO()
         wb.save(buf)
         data = buf.getvalue()
@@ -836,9 +933,9 @@ def export_models(admin: dict = Depends(require_model_admin)):
         raise
 
     filename = f"models_{now_ms()}.xlsx"
-    _write_transfer_meta(
-        "export", username, filename, len(data), _XLSX_MIME,
-        remark="模型数据导出", status="success",
+    _write_transfer_record(
+        "export", username, filename, data, _XLSX_MIME,
+        remark=f"模型数据导出（{'当前筛选结果' if scope == 'filtered' else '全部'}）", status="success",
     )
     return StreamingResponse(
         iter([data]),
@@ -1336,16 +1433,10 @@ def delete_model(model_id: int, admin: dict = Depends(require_model_admin)):
     return {"ok": True}
 
 
-@router.get("/settings")
-def list_settings(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
-    search: str = "",
-    enabled: str = "",
-    sort: str = "",
-    order: str = "asc",
-):
-    offset = (page - 1) * page_size
+def _settings_where_sort(
+    search: str = "", enabled: str = "", sort: str = "", order: str = "asc"
+) -> tuple[str, list, str]:
+    """settings 筛选 + 排序构建：列表 / 条件导出 / 计数共用。"""
     clauses: list[str] = []
     params: list = []
     if search:
@@ -1360,6 +1451,28 @@ def list_settings(
     if sort in sort_columns:
         direction = "ASC" if order.strip().lower() == "asc" else "DESC"
         order_by = f"{sort_columns[sort]} {direction}"
+    return where, params, order_by
+
+
+@router.get("/settings/count")
+def count_settings(admin: dict = Depends(require_admin)):
+    """导出面板"全部数据量"查询：不受筛选影响的配置项总数。"""
+    return {"total": fetch_one("SELECT COUNT(*) AS n FROM settings")["n"]}
+
+
+@router.get("/settings")
+def list_settings(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str = "",
+    enabled: str = "",
+    sort: str = "",
+    order: str = "asc",
+):
+    offset = (page - 1) * page_size
+    where, params, order_by = _settings_where_sort(
+        search=search, enabled=enabled, sort=sort, order=order
+    )
     total = fetch_one(f"SELECT COUNT(*) AS n FROM settings {where}", params)["n"]
     rows = fetch_all(
         f"SELECT * FROM settings {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
@@ -1445,31 +1558,49 @@ def delete_setting(key: str, admin: dict = Depends(require_settings_admin)):
 _SETTING_FIELDS = ["key", "value", "remark", "enabled"]
 
 
-def _setting_rows() -> list[list]:
-    rows = fetch_all("SELECT * FROM settings ORDER BY key")
-    return [
-        [r["key"], "" if r["value"] is None else r["value"], "" if r["remark"] is None else r["remark"], 1 if r["enabled"] else 0]
-        for r in rows
-    ]
-
-
 @router.get("/settings/export")
-def export_settings(admin: dict = Depends(require_settings_admin)):
-    """导出全部配置项为 xlsx。导出不存产物：仅写行为记录。"""
+def export_settings(
+    search: str = "",
+    enabled: str = "",
+    sort: str = "",
+    order: str = "asc",
+    scope: str = "all",
+    admin: dict = Depends(require_settings_admin),
+):
+    """导出配置项为 xlsx。scope=filtered 按当前筛选与排序导出，scope=all 导出全部。
+    导出产物落盘保存（快照语义），超期按 export_file_retention_hours 清理、记录保留。"""
     username = admin.get("username") or "admin"
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "settings"
-    ws.append(_SETTING_FIELDS)
-    for row in _setting_rows():
-        ws.append(row)
-    buf = io.BytesIO()
-    wb.save(buf)
-    data = buf.getvalue()
+    where, params, order_by = _settings_where_sort(
+        search=search, enabled=enabled, sort=sort, order=order
+    )
+    try:
+        rows = fetch_all(f"SELECT * FROM settings {where} ORDER BY {order_by}", params)
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "settings"
+        ws.append(_SETTING_FIELDS)
+        for r in rows:
+            ws.append(
+                [
+                    r["key"],
+                    "" if r["value"] is None else r["value"],
+                    "" if r["remark"] is None else r["remark"],
+                    1 if r["enabled"] else 0,
+                ]
+            )
+        buf = io.BytesIO()
+        wb.save(buf)
+        data = buf.getvalue()
+    except Exception as err:
+        _write_transfer_meta(
+            "export", username, f"settings_{now_ms()}.xlsx", 0, _XLSX_MIME,
+            remark=f"配置数据导出失败：{err}", status="failed",
+        )
+        raise
     filename = f"settings_{now_ms()}.xlsx"
-    _write_transfer_meta(
-        "export", username, filename, len(data), _XLSX_MIME,
-        remark="配置数据导出", status="success",
+    _write_transfer_record(
+        "export", username, filename, data, _XLSX_MIME,
+        remark=f"配置数据导出（{'当前筛选结果' if scope == 'filtered' else '全部'}）", status="success",
     )
     return StreamingResponse(
         iter([data]),
@@ -1799,21 +1930,14 @@ def delete_dim_table(table_id: int, admin: dict = Depends(require_settings_admin
     return {"ok": True}
 
 
-@router.get("/dim-tables/{table_id}/values")
-def list_dim_values(
+def _dim_values_where_sort(
     table_id: int,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
     search: str = "",
     enabled: str = "",
     sort: str = "",
     order: str = "asc",
-    admin: dict = Depends(require_settings_admin),
-):
-    table = fetch_one("SELECT id FROM dim_tables WHERE id = ?", (table_id,))
-    if not table:
-        raise HTTPException(status_code=404, detail="维表不存在")
-    offset = (page - 1) * page_size
+) -> tuple[str, list, str]:
+    """dim_values 筛选 + 排序构建：列表 / 条件导出 / 计数共用。"""
     clauses = ["table_id = ?"]
     params: list = [table_id]
     if search:
@@ -1835,6 +1959,37 @@ def list_dim_values(
     if sort in sort_columns:
         direction = "ASC" if order.strip().lower() == "asc" else "DESC"
         order_by = f"{sort_columns[sort]} {direction}, id"
+    return where, params, order_by
+
+
+@router.get("/dim-tables/{table_id}/values/count")
+def count_dim_values(table_id: int, admin: dict = Depends(require_admin)):
+    """导出面板"全部数据量"查询：不受筛选影响的维表取值总数。"""
+    if not fetch_one("SELECT id FROM dim_tables WHERE id = ?", (table_id,)):
+        raise HTTPException(status_code=404, detail="维表不存在")
+    return {"total": fetch_one(
+        "SELECT COUNT(*) AS n FROM dim_values WHERE table_id = ?", (table_id,)
+    )["n"]}
+
+
+@router.get("/dim-tables/{table_id}/values")
+def list_dim_values(
+    table_id: int,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str = "",
+    enabled: str = "",
+    sort: str = "",
+    order: str = "asc",
+    admin: dict = Depends(require_settings_admin),
+):
+    table = fetch_one("SELECT id FROM dim_tables WHERE id = ?", (table_id,))
+    if not table:
+        raise HTTPException(status_code=404, detail="维表不存在")
+    offset = (page - 1) * page_size
+    where, params, order_by = _dim_values_where_sort(
+        table_id, search=search, enabled=enabled, sort=sort, order=order
+    )
     total = fetch_one(f"SELECT COUNT(*) AS n FROM dim_values {where}", params)["n"]
     rows = fetch_all(
         f"SELECT * FROM dim_values {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
@@ -2135,31 +2290,64 @@ def _dim_xlsx_response(wb: openpyxl.Workbook, filename: str) -> StreamingRespons
 
 @router.get("/dim-tables/{table_id}/export")
 def export_dim_values(
-    table_id: int, request: Request, admin: dict = Depends(require_settings_admin)
+    table_id: int,
+    search: str = "",
+    enabled: str = "",
+    sort: str = "",
+    order: str = "asc",
+    scope: str = "all",
+    admin: dict = Depends(require_settings_admin),
 ):
-    """导出某维表全部取值为 xlsx（列由字段规格决定，model_provider 含 name_en/api_key）。"""
+    """导出维表取值为 xlsx。scope=filtered 按当前筛选与排序导出，scope=all 导出全部；
+    非 super/system 管理员导出时 api_key 同样脱敏。产物落盘保存（快照语义），
+    超期按 export_file_retention_hours 清理、记录保留。"""
     table = _dim_table_or_404(table_id)
     spec = _dim_value_field_spec(table["code"])
     keys = [f["key"] for f in spec]
-    rows = fetch_all(
-        "SELECT * FROM dim_values WHERE table_id = ? ORDER BY sort_order, id", (table_id,)
-    )
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "values"
-    ws.append(keys)
-    for r in rows:
-        ws.append(["" if r[k] is None else r[k] for k in keys])
     username = admin.get("username") or "admin"
     fname = f"dim_{table['code']}_{now_ms()}.xlsx"
-    resp = _dim_xlsx_response(wb, fname)
-    # 导出行为记录（不落盘产物）
-    buf_size = sum(1 for _ in rows)
-    _write_transfer_meta(
-        "export", username, fname, buf_size, _XLSX_MIME,
-        remark=f"维表「{table['name']}」导出",
+    where, params, order_by = _dim_values_where_sort(
+        table_id, search=search, enabled=enabled, sort=sort, order=order
     )
-    return resp
+    try:
+        rows = fetch_all(
+            f"SELECT * FROM dim_values {where} ORDER BY {order_by}", params
+        )
+        # 与列表一致：非特权管理员导出也不落明文 api_key
+        privileged = admin.get("role") in (ROLE_SUPER_ADMIN, ROLE_SYSTEM_ADMIN)
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "values"
+        ws.append(keys)
+        for r in rows:
+            vals = []
+            for k in keys:
+                v = r[k]
+                if v is None:
+                    v = ""
+                if k == "api_key" and not privileged:
+                    v = _mask_secret(v)
+                vals.append(v)
+            ws.append(vals)
+        buf = io.BytesIO()
+        wb.save(buf)
+        data = buf.getvalue()
+    except Exception as err:
+        _write_transfer_meta(
+            "export", username, fname, 0, _XLSX_MIME,
+            remark=f"维表「{table['name']}」导出失败：{err}", status="failed",
+        )
+        raise
+    _write_transfer_record(
+        "export", username, fname, data, _XLSX_MIME,
+        remark=f"维表「{table['name']}」导出（{'当前筛选结果' if scope == 'filtered' else '全部'}）",
+        status="success",
+    )
+    return StreamingResponse(
+        iter([data]),
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @router.get("/dim-tables/{table_id}/template")
@@ -2376,19 +2564,31 @@ async def import_dim_values(
 
 _TRANSFER_DIR = os.path.join(os.path.dirname(settings.db_path) or ".", "transfers")
 
-# 导入源文件保留时长（小时）配置项，存于数据字典 settings；缺失/禁用/非法时回退默认值
+# 导入源文件 / 导出产物保留时长（小时）配置项，存于数据字典 settings；缺失/禁用/非法时回退默认值
 RETENTION_SETTING_KEY = "import_file_retention_hours"
+EXPORT_RETENTION_SETTING_KEY = "export_file_retention_hours"
 DEFAULT_IMPORT_RETENTION_HOURS = 720  # 30 天
+DEFAULT_EXPORT_RETENTION_HOURS = 720  # 30 天
 _POSITIVE_INT_RE = re.compile(r"^[1-9]\d*$")
 
 
-def get_import_retention_hours() -> int:
-    """读取导入源文件保留时长（小时）：仅接受 >0 的正整数，否则回退默认 720。"""
-    row = fetch_one("SELECT value, enabled FROM settings WHERE key = ?", (RETENTION_SETTING_KEY,))
+def _get_retention_hours(key: str, default_hours: int) -> int:
+    """读取保留时长 settings 键：仅接受 >0 的正整数，否则回退默认。"""
+    row = fetch_one("SELECT value, enabled FROM settings WHERE key = ?", (key,))
     if not row or not row["enabled"]:
-        return DEFAULT_IMPORT_RETENTION_HOURS
+        return default_hours
     s = str(row["value"] or "").strip()
-    return int(s) if _POSITIVE_INT_RE.fullmatch(s) else DEFAULT_IMPORT_RETENTION_HOURS
+    return int(s) if _POSITIVE_INT_RE.fullmatch(s) else default_hours
+
+
+def get_import_retention_hours() -> int:
+    """导入源文件保留时长（小时）。"""
+    return _get_retention_hours(RETENTION_SETTING_KEY, DEFAULT_IMPORT_RETENTION_HOURS)
+
+
+def get_export_retention_hours() -> int:
+    """导出产物保留时长（小时）。"""
+    return _get_retention_hours(EXPORT_RETENTION_SETTING_KEY, DEFAULT_EXPORT_RETENTION_HOURS)
 
 
 def validate_setting_value(key: str, value) -> str | None:
@@ -2397,47 +2597,52 @@ def validate_setting_value(key: str, value) -> str | None:
         s = str(value if value is not None else "").strip()
         if not _POSITIVE_INT_RE.fullmatch(s):
             return "导入源文件保留时长必须为大于 0 的正整数（单位：小时）"
+    if key == EXPORT_RETENTION_SETTING_KEY:
+        s = str(value if value is not None else "").strip()
+        if not _POSITIVE_INT_RE.fullmatch(s):
+            return "导出文件保留时长必须为大于 0 的正整数（单位：小时）"
     return None
 
-# 过期导入源文件清理：只删磁盘文件、保留数据库记录（file_path 置空作为“已清理”标记）
+# 过期导入源文件 / 导出产物清理：只删磁盘文件、保留数据库记录（file_path 置空作为"已清理"标记）
 _LAST_PURGE_MONO = 0.0          # 上次懒清理的单调时钟（秒）
 _PURGE_INTERVAL_SEC = 6 * 3600  # 列表请求触发清理的最小间隔：6 小时
 
 
-def purge_expired_import_files() -> int:
-    """清理超过保留期的导入源文件以释放磁盘；记录保留，仅把 file_path 置空。
+def purge_expired_transfer_files() -> int:
+    """清理超过各自保留期的导入源文件与导出产物以释放磁盘；记录保留，仅把 file_path 置空。
 
-    - 只处理 type='import'（导出本就不落盘，无需清理）
+    - 导入按 import_file_retention_hours、导出按 export_file_retention_hours 分别计算截止线
     - 物理删除严格限制在 _TRANSFER_DIR 内，防路径穿越
     - 即使磁盘文件已不存在，也把残留 file_path 置空（幂等，可重复执行）
     返回被清理（置空 file_path）的记录条数。
     """
-    retention_hours = get_import_retention_hours()
-    cutoff = now_ms() - retention_hours * 3600 * 1000
-    rows = fetch_all(
-        "SELECT id, file_path FROM transfer_records "
-        "WHERE type='import' AND created_at < ? AND file_path != ''",
-        (cutoff,),
-    )
-    if not rows:
-        return 0
-    base = os.path.abspath(_TRANSFER_DIR)
     cleaned = 0
-    for r in rows:
-        full = os.path.abspath(r["file_path"] or "")
-        if full and (full == base or full.startswith(base + os.sep)):
-            try:
-                if os.path.isfile(full):
-                    os.remove(full)
-            except OSError:
-                pass
-        # 无论文件是否还在，都置空 file_path，标记源文件已按保留策略清理（幂等）
-        execute("UPDATE transfer_records SET file_path='' WHERE id=?", (r["id"],))
-        cleaned += 1
+    for type_, hours in (
+        ("import", get_import_retention_hours()),
+        ("export", get_export_retention_hours()),
+    ):
+        cutoff = now_ms() - hours * 3600 * 1000
+        rows = fetch_all(
+            "SELECT id, file_path FROM transfer_records "
+            "WHERE type=? AND created_at < ? AND file_path != ''",
+            (type_, cutoff),
+        )
+        base = os.path.abspath(_TRANSFER_DIR)
+        for r in rows:
+            full = os.path.abspath(r["file_path"] or "")
+            if full and (full == base or full.startswith(base + os.sep)):
+                try:
+                    if os.path.isfile(full):
+                        os.remove(full)
+                except OSError:
+                    pass
+            # 无论文件是否还在，都置空 file_path，标记已按保留策略清理（幂等）
+            execute("UPDATE transfer_records SET file_path='' WHERE id=?", (r["id"],))
+            cleaned += 1
     return cleaned
 
 
-def maybe_purge_expired_imports() -> None:
+def maybe_purge_expired_transfers() -> None:
     """列表请求触发的节流懒清理：距上次超过间隔才真正扫库，避免每次请求都清理。"""
     global _LAST_PURGE_MONO
     import time as _time
@@ -2447,7 +2652,7 @@ def maybe_purge_expired_imports() -> None:
         return
     _LAST_PURGE_MONO = now_mono  # 先置位，避免并发请求重复清理
     try:
-        purge_expired_import_files()
+        purge_expired_transfer_files()
     except Exception:
         # 清理是旁路维护，任何异常都不能影响正常列表查询
         pass
@@ -2466,7 +2671,7 @@ def list_transfers(
     if type not in ("import", "export"):
         raise HTTPException(status_code=400, detail="type 仅支持 import/export")
     # 旁路：打开记录列表时节流触发过期导入源文件清理（6h 一次，失败不影响查询）
-    maybe_purge_expired_imports()
+    maybe_purge_expired_transfers()
     offset = (page - 1) * page_size
     clauses = ["type = ?"]
     params: list = [type]
@@ -2508,6 +2713,7 @@ def list_transfers(
         "page": page,
         "pageSize": page_size,
         "retention_hours": get_import_retention_hours(),
+        "export_retention_hours": get_export_retention_hours(),
     }
 
 
