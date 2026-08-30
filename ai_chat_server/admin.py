@@ -25,7 +25,18 @@ from .auth import (
     require_super_admin,
 )
 from .config import settings
-from .db import DEFAULT_MODEL_PROVIDERS, execute, fetch_all, fetch_one, now_ms, transaction
+from .db import (
+    DEFAULT_MODEL_PROVIDERS,
+    DIM_CORE_FIELDS,
+    DIM_PHYSICAL_COLUMNS,
+    default_dim_fields,
+    execute,
+    fetch_all,
+    fetch_one,
+    now_ms,
+    seed_dim_table_fields,
+    transaction,
+)
 from .schemas import (
     DimTableCreate,
     DimTableOut,
@@ -34,6 +45,7 @@ from .schemas import (
     DimValueList,
     DimValueOut,
     DimValueUpdate,
+    DimFieldsPayload,
     ModelPayload,
     OperationLogList,
     ResetPasswordRequest,
@@ -90,9 +102,12 @@ def _make_row_fail(errors: list[str], row_errors: dict[int, str], is_en: bool):
     return row_fail
 
 
-def _missing_col(key: str, is_en: bool) -> str:
-    """缺列提示：中文用本地化表头名，英文用「字段名 column」的英文语序。"""
-    label = _HEADER_LABELS.get(key)
+def _missing_col(
+    key: str, is_en: bool, labels: dict[str, tuple[str, str]] | None = None
+) -> str:
+    """缺列提示：中文用本地化表头名，英文用「字段名 column」的英文语序。
+    labels 为该模块的表头标签表（维表取自字段配置，可能和静态字典不同）。"""
+    label = (labels or {}).get(key) or _HEADER_LABELS.get(key)
     if not label:
         return f"xlsx is missing the {key} column" if is_en else f"xlsx 缺少 {key} 列"
     return (
@@ -158,6 +173,16 @@ _DIM_HEADERS: dict[str, tuple[str, str]] = {
 }
 
 
+# 导入模板示例行的取值（按字段名）。布尔列给「是/否」、整型列给 0，由列规格自动生成，不在此列。
+_DIM_EXAMPLE: dict[str, tuple[str, str]] = {
+    "code": ("example_code", "example_code"),
+    "name": ("示例名称", "Example Name"),
+    "name_en": ("Example Name", "Example Name"),
+    "api_key": ("sk-xxxx", "sk-xxxx"),
+    "remark": ("", ""),
+}
+
+
 # 字段名 → (中文, 英文) 汇总表，供缺列等错误提示按字段名取本地化措辞
 _HEADER_LABELS: dict[str, tuple[str, str]] = {
     **_MODEL_HEADERS,
@@ -172,6 +197,19 @@ def _localized_headers(
 ) -> list[str]:
     """按语言生成表头行：英文环境取英文，中文环境取中文，字典未覆盖时回退字段名。"""
     return [table.get(k, (k, k))[1 if is_en else 0] for k in keys]
+
+
+def _spec_label_table(spec: list[dict]) -> dict[str, tuple[str, str]]:
+    """把维表列规格转成 {字段名: (中文, 英文)}，喂给 _localized_headers / _resolve_headers。
+
+    标签来自 dim_table_fields 配置；配置缺标签时回退静态字典，再退回字段名。
+    """
+    out: dict[str, tuple[str, str]] = {}
+    for f in spec:
+        key = f["key"]
+        fallback = _HEADER_LABELS.get(key, (key, key))
+        out[key] = (f.get("label_zh") or fallback[0], f.get("label_en") or fallback[1])
+    return out
 
 
 def _build_header_aliases() -> dict[str, str]:
@@ -1379,11 +1417,15 @@ async def import_models(
     if row_errors:
         try:
             ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name, is_en)
+            # 注释文件用 atomic rename 覆盖原文件，避开 safe-delete 触发的 SystemExit
             if os.path.isfile(saved_path):
-                os.remove(saved_path)
+                os.replace(ann_path, saved_path)
+                final_path = saved_path
+            else:
+                final_path = ann_path
             execute(
                 "UPDATE transfer_records SET file_path=?, file_size=? WHERE id=?",
-                (ann_path, ann_size, record_id),
+                (final_path, ann_size, record_id),
             )
         except Exception:
             pass  # 标注失败保留源文件，不影响导入主流程
@@ -1950,11 +1992,15 @@ async def import_settings(
     if row_errors:
         try:
             ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name, is_en)
+            # 注释文件用 atomic rename 覆盖原文件，避开 safe-delete 触发的 SystemExit
             if os.path.isfile(saved_path):
-                os.remove(saved_path)
+                os.replace(ann_path, saved_path)
+                final_path = saved_path
+            else:
+                final_path = ann_path
             execute(
                 "UPDATE transfer_records SET file_path=?, file_size=? WHERE id=?",
-                (ann_path, ann_size, record_id),
+                (final_path, ann_size, record_id),
             )
         except Exception:
             pass
@@ -2086,6 +2132,8 @@ def create_dim_table(body: DimTableCreate, admin: dict = Depends(require_setting
         "VALUES (?, ?, ?, 0, ?, ?, ?)",
         (body.code, body.name, body.description, ts, ts, admin.get("username") or "admin"),
     )
+    # 建表即写入默认字段配置，后续导出/模板/导入无需再改代码
+    seed_dim_table_fields(cur)
     row = fetch_one("SELECT * FROM dim_tables WHERE id = ?", (cur,))
     return _dim_table_out(row)
 
@@ -2456,25 +2504,81 @@ def _dim_table_or_404(table_id: int) -> dict:
     return dict(t)
 
 
-def _dim_value_field_spec(table_code: str) -> list[dict]:
-    """维表取值的列规格，统一驱动「导出表头 / 模板 / 导入解析与校验 / upsert」。
-    以后新增维表：通用列自动覆盖；若有专属列，只需在此按 table_code 扩展，接口无需重写。
-    字段含义：required 必填；max_len 长度上限；no_cjk 禁中文；is_int 整型；is_bool 布尔。"""
-    fields: list[dict] = [
-        {"key": "code", "required": True, "max_len": 64},
-        {"key": "name", "required": True, "max_len": 128},
+def _dim_spec_item(
+    key: str,
+    label_zh: str,
+    label_en: str,
+    field_type: str,
+    required: int,
+    max_len: int,
+    no_cjk: int,
+) -> dict:
+    """把一条字段配置转成导入导出/校验共用的列规格。
+    字段含义：required 必填；max_len 长度上限；no_cjk 禁中文；
+    is_int 整型；is_bool 布尔；is_secret 导出脱敏。"""
+    f: dict = {"key": key, "label_zh": label_zh, "label_en": label_en, "type": field_type}
+    if required:
+        f["required"] = True
+    if max_len:
+        f["max_len"] = max_len
+    if no_cjk:
+        f["no_cjk"] = True
+    if field_type == "int":
+        f["is_int"] = True
+        f["default"] = 0
+    elif field_type == "bool":
+        f["is_bool"] = True
+        f["default"] = 1
+    elif field_type == "secret":
+        f["is_secret"] = True
+    return f
+
+
+def _dim_spec_from_template(table_code: str) -> list[dict]:
+    """用代码内置模板生成列规格：新维表与「dim_table_fields 无配置」时走这里。"""
+    return [
+        _dim_spec_item(k, zh, en, ft, req, ml, nc)
+        for (k, zh, en, ft, req, ml, nc, _so, _on) in default_dim_fields(table_code)
     ]
-    if table_code == "model_provider":
-        fields.append({"key": "name_en", "required": True, "max_len": 128, "no_cjk": True})
-        fields.append({"key": "api_key", "max_len": 512})
-    fields.extend(
-        [
-            {"key": "sort_order", "is_int": True, "default": 0},
-            {"key": "enabled", "is_bool": True, "default": 1},
-            {"key": "remark", "max_len": 255},
-        ]
+
+
+def _dim_value_field_spec(table_id: int, table_code: str) -> list[dict]:
+    """维表取值的列规格，统一驱动「导出表头 / 模板 / 导入解析与校验 / upsert」。
+
+    优先读 dim_table_fields（每个维表可自行开关列、改中英文列头、调校验规则）；
+    该表无配置时回退代码内置模板，保证老库与新维表零配置也能正常工作。
+    code / name 是导入定位行的依据，即便配置里被关掉也会强制补回。
+    """
+    rows = fetch_all(
+        "SELECT field_key, label_zh, label_en, field_type, required, max_len, no_cjk "
+        "FROM dim_table_fields WHERE table_id = ? AND enabled = 1 ORDER BY sort_order, id",
+        (table_id,),
     )
-    return fields
+    if not rows:
+        return _dim_spec_from_template(table_code)
+
+    spec: list[dict] = []
+    for r in rows:
+        # 只认物理列，避免 field_key 被拼进 INSERT/UPDATE 语句造成注入
+        if r["field_key"] not in DIM_PHYSICAL_COLUMNS:
+            continue
+        spec.append(
+            _dim_spec_item(
+                r["field_key"],
+                r["label_zh"],
+                r["label_en"],
+                (r["field_type"] or "text"),
+                r["required"],
+                r["max_len"],
+                r["no_cjk"],
+            )
+        )
+    for pos, must in enumerate(DIM_CORE_FIELDS):
+        if any(f["key"] == must for f in spec):
+            continue
+        tpl = next(f for f in _dim_spec_from_template(table_code) if f["key"] == must)
+        spec.insert(pos, tpl)
+    return spec
 
 
 def _dim_xlsx_response(wb: openpyxl.Workbook, filename: str) -> StreamingResponse:
@@ -2505,8 +2609,10 @@ def export_dim_values(
     超期按 export_file_retention_hours 清理、记录保留。"""
     is_en = _is_en(request)
     table = _dim_table_or_404(table_id)
-    spec = _dim_value_field_spec(table["code"])
+    spec = _dim_value_field_spec(table_id, table["code"])
     keys = [f["key"] for f in spec]
+    labels = _spec_label_table(spec)
+    secret_keys = {f["key"] for f in spec if f.get("is_secret")}
     username = admin.get("username") or "admin"
     fname = f"dim_{table['code']}_{now_ms()}.xlsx"
     where, params, order_by = _dim_values_where_sort(
@@ -2521,14 +2627,14 @@ def export_dim_values(
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "values"
-        ws.append(_localized_headers(keys, _DIM_HEADERS, is_en))
+        ws.append(_localized_headers(keys, labels, is_en))
         for r in rows:
             vals = []
             for k in keys:
                 v = r[k]
                 if v is None:
                     v = ""
-                if k == "api_key" and not privileged:
+                if k in secret_keys and not privileged:
                     v = _mask_secret(v)
                 vals.append(v)
             ws.append(vals)
@@ -2557,34 +2663,30 @@ def export_dim_values(
 def download_dim_template(
     table_id: int, request: Request, admin: dict = Depends(require_settings_admin)
 ):
-    """下载维表取值导入模板：本地化表头 + 本地化示例行 + enabled 布尔下拉。"""
+    """下载维表取值导入模板：本地化表头 + 本地化示例行 + enabled 布尔下拉。
+    列与示例值全部由该维表的字段配置驱动，新增/关闭字段不需要改这里。"""
     table = _dim_table_or_404(table_id)
     is_en = _is_en(request)
-    spec = _dim_value_field_spec(table["code"])
+    spec = _dim_value_field_spec(table_id, table["code"])
     keys = [f["key"] for f in spec]
-    is_provider = table["code"] == "model_provider"
 
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "values"
-    ws.append(_localized_headers(keys, _DIM_HEADERS, is_en))
-    if is_provider:
-        example = (
-            ["example_code", "Example Name", "Example EN Name", "sk-xxxx", 0, "yes", ""]
-            if is_en
-            else ["example_code", "示例名称", "Example Name", "sk-xxxx", 0, "是", ""]
-        )
-    else:
-        example = (
-            ["example_code", "Example Name", 0, "yes", ""]
-            if is_en
-            else ["example_code", "示例名称", 0, "是", ""]
-        )
+    ws.append(_localized_headers(keys, _spec_label_table(spec), is_en))
+    # 示例行按列规格逐列生成：布尔列给「是/否」，整型列给 0，其余查示例值表
+    example: list[object] = []
+    for f in spec:
+        if f.get("is_bool"):
+            example.append("yes" if is_en else "是")
+        elif f.get("is_int"):
+            example.append(0)
+        else:
+            ex = _DIM_EXAMPLE.get(f["key"]) or ("示例", "Example")
+            example.append(ex[1] if is_en else ex[0])
     ws.append(example)
 
-    # enabled 列布尔下拉
-    enabled_idx = keys.index("enabled") + 1
-    letter = get_column_letter(enabled_idx)
+    # 布尔列下拉：所有 is_bool 列都套上（当前只有 enabled，配置新增 bool 列自动生效）
     dv = DataValidation(
         type="list",
         formula1='"yes,no"' if is_en else '"是,否"',
@@ -2594,9 +2696,92 @@ def download_dim_template(
     dv.error = 'Please choose "yes" or "no"' if is_en else "请选择「是」或「否」"
     dv.errorTitle = "Invalid value" if is_en else "非法值"
     ws.add_data_validation(dv)
-    dv.add(f"{letter}2:{letter}1000")
+    for i, f in enumerate(spec, start=1):
+        if f.get("is_bool"):
+            letter = get_column_letter(i)
+            dv.add(f"{letter}2:{letter}1000")
 
     return _dim_xlsx_response(wb, f"dim_{table['code']}_template.xlsx")
+
+
+@router.get("/dim-tables/{table_id}/fields")
+def list_dim_fields(table_id: int, admin: dict = Depends(require_settings_admin)):
+    """读取某维表的字段配置：列顺序、中英文列头、类型与校验规则。
+
+    dim_table_fields 尚无记录时返回代码内置模板并标记 persisted=false ——
+    此时导出/导入仍按模板工作，前端可原样展示与编辑，保存后才落库。
+    """
+    table = _dim_table_or_404(table_id)
+    rows = fetch_all(
+        "SELECT field_key, label_zh, label_en, field_type, required, max_len, no_cjk, sort_order, enabled "
+        "FROM dim_table_fields WHERE table_id = ? ORDER BY sort_order, id",
+        (table_id,),
+    )
+    if rows:
+        return {"items": [dict(r) for r in rows], "persisted": True}
+    items = [
+        {
+            "field_key": k,
+            "label_zh": zh,
+            "label_en": en,
+            "field_type": ft,
+            "required": bool(req),
+            "max_len": ml,
+            "no_cjk": bool(nc),
+            "sort_order": so,
+            "enabled": bool(on),
+        }
+        for (k, zh, en, ft, req, ml, nc, so, on) in default_dim_fields(table["code"])
+    ]
+    return {"items": items, "persisted": False}
+
+
+@router.put("/dim-tables/{table_id}/fields")
+def save_dim_fields(
+    table_id: int, body: DimFieldsPayload, admin: dict = Depends(require_settings_admin)
+):
+    """批量保存某维表的字段配置（upsert）。仅超级管理员 / 系统管理员可写。
+
+    约束：
+    - field_key 必须在 dim_values 物理列白名单内（会被拼进 INSERT/UPDATE 语句，防注入）；
+    - code / name 是导入定位行的依据，强制启用且必填，忽略请求里的相反设置；
+    - 关闭某列只是「不出现在导出与模板里」，库里的历史数据保留，导入时该列不更新。
+    """
+    _dim_table_or_404(table_id)
+    for it in body.items:
+        if it.field_key not in DIM_PHYSICAL_COLUMNS:
+            raise HTTPException(status_code=422, detail=f"不支持的字段：{it.field_key}")
+
+    queries: list[tuple[str, tuple]] = []
+    for idx, it in enumerate(body.items, start=1):
+        key = it.field_key
+        is_core = key in DIM_CORE_FIELDS
+        queries.append(
+            (
+                "INSERT INTO dim_table_fields "
+                "(table_id, field_key, label_zh, label_en, field_type, required, max_len, no_cjk, sort_order, enabled) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(table_id, field_key) DO UPDATE SET "
+                "label_zh=excluded.label_zh, label_en=excluded.label_en, field_type=excluded.field_type, "
+                "required=excluded.required, max_len=excluded.max_len, no_cjk=excluded.no_cjk, "
+                "sort_order=excluded.sort_order, enabled=excluded.enabled",
+                (
+                    table_id,
+                    key,
+                    it.label_zh or key,
+                    it.label_en or key,
+                    it.field_type,
+                    1 if (it.required or is_core) else 0,
+                    it.max_len,
+                    1 if it.no_cjk else 0,
+                    it.sort_order or idx * 10,
+                    1 if (it.enabled or is_core) else 0,
+                ),
+            )
+        )
+    if queries:
+        transaction(queries)
+    return {"ok": True, "saved": len(queries)}
 
 
 @router.post("/dim-tables/{table_id}/import")
@@ -2610,9 +2795,10 @@ async def import_dim_values(
     表头中英文通吃，与当前界面语言无关（只关心数据行）。"""
     is_en = _is_en(request)
     table = _dim_table_or_404(table_id)
-    spec = _dim_value_field_spec(table["code"])
+    spec = _dim_value_field_spec(table_id, table["code"])
     spec_by_key = {f["key"]: f for f in spec}
     keys = [f["key"] for f in spec]
+    labels = _spec_label_table(spec)
 
     raw = await file.read()
     original_name = file.filename or "dim_import.xlsx"
@@ -2658,12 +2844,13 @@ async def import_dim_values(
         _mark_failed("空文件")
         raise HTTPException(status_code=400, detail=_t("空文件", "Empty file", is_en))
 
-    # 表头中英文双向兼容：中文表头经别名表翻译成字段 key，英文 key 直通
-    header = _resolve_headers(header_row, _DIM_HEADERS)
-    for must in ("code", "name"):
+    # 表头中英文双向兼容：中文表头经别名表翻译成字段 key，英文 key 直通。
+    # 别名表取自该维表的字段配置，所以改了列头名之后历史文件依然能导入。
+    header = _resolve_headers(header_row, labels)
+    for must in DIM_CORE_FIELDS:
         if must not in header:
             _mark_failed(f"缺少 {must} 列")
-            raise HTTPException(status_code=400, detail=_missing_col(must, is_en))
+            raise HTTPException(status_code=400, detail=_missing_col(must, is_en, labels))
     # 只识别规格内、且表头里存在的列
     idx = {h: i for i, h in enumerate(header)}
     active_keys = [k for k in keys if k in idx]
@@ -2698,7 +2885,7 @@ async def import_dim_values(
         bad: tuple[str, str] | None = None  # (中文, 英文) 双语错误，交给 row_fail 按语言取用
         for k in active_keys:
             f = spec_by_key[k]
-            label_zh, label_en = _HEADER_LABELS.get(k, (k, k))
+            label_zh, label_en = labels.get(k, (k, k))
             raw_v = cell(row, k, "" if not f.get("is_bool") and not f.get("is_int") else 0)
             if f.get("is_bool"):
                 values[k] = _parse_bool(raw_v)
@@ -2767,11 +2954,15 @@ async def import_dim_values(
     if row_errors:
         try:
             ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name, is_en)
+            # 注释文件用 atomic rename 覆盖原文件，避开 safe-delete 触发的 SystemExit
             if os.path.isfile(saved_path):
-                os.remove(saved_path)
+                os.replace(ann_path, saved_path)
+                final_path = saved_path
+            else:
+                final_path = ann_path
             execute(
                 "UPDATE transfer_records SET file_path=?, file_size=? WHERE id=?",
-                (ann_path, ann_size, record_id),
+                (final_path, ann_size, record_id),
             )
         except Exception:
             pass

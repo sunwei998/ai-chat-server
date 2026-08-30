@@ -125,6 +125,24 @@ CREATE TABLE IF NOT EXISTS dim_values (
 
 CREATE INDEX IF NOT EXISTS idx_dim_values_table ON dim_values (table_id);
 
+CREATE TABLE IF NOT EXISTS dim_table_fields (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_id INTEGER NOT NULL,
+  field_key TEXT NOT NULL,
+  label_zh TEXT NOT NULL DEFAULT '',
+  label_en TEXT NOT NULL DEFAULT '',
+  field_type TEXT NOT NULL DEFAULT 'text',
+  required INTEGER NOT NULL DEFAULT 0,
+  max_len INTEGER NOT NULL DEFAULT 0,
+  no_cjk INTEGER NOT NULL DEFAULT 0,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  UNIQUE (table_id, field_key),
+  FOREIGN KEY (table_id) REFERENCES dim_tables(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_dim_fields_table ON dim_table_fields (table_id);
+
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL,
@@ -297,6 +315,74 @@ DEFAULT_MODEL_PROVIDERS = [
 ]
 
 
+# ============ 维表字段配置（dim_table_fields） ============
+# dim_values 的物理列是固定 7 列超集，字段配置只控制「该维表启用哪些列、列头叫什么、怎么校验」，
+# 因此新增一种维表不需要改表结构，只需要在 dim_table_fields 里写几行。
+#
+# 元组含义：
+#   field_key, label_zh, label_en, field_type, required, max_len, no_cjk, sort_order, enabled
+_DIM_FIELD_TEMPLATE: tuple[tuple, ...] = (
+    ("code", "编码", "Code", "text", 1, 64, 0, 10, 1),
+    ("name", "名称", "Name", "text", 1, 128, 0, 20, 1),
+    ("sort_order", "排序", "Sort", "int", 0, 0, 0, 50, 1),
+    ("enabled", "启用", "Enabled", "bool", 0, 0, 0, 60, 1),
+    ("remark", "备注", "Remark", "text", 0, 255, 0, 70, 1),
+)
+
+# 特定维表在通用列之外追加的字段（按 table_code）
+_DIM_EXTRA_FIELDS: dict[str, tuple[tuple, ...]] = {
+    "model_provider": (
+        ("name_en", "英文名称", "English Name", "text", 1, 128, 1, 30, 1),
+        ("api_key", "API密钥", "API Key", "secret", 0, 512, 0, 40, 1),
+    ),
+}
+
+# dim_values 真实存在的物理列。field_key 会被拼进 INSERT/UPDATE 语句，必须白名单校验。
+DIM_PHYSICAL_COLUMNS: frozenset[str] = frozenset(
+    {"code", "name", "name_en", "api_key", "sort_order", "enabled", "remark"}
+)
+
+# 导入时定位行的依据列，配置层面不允许关闭/置为非必填
+DIM_CORE_FIELDS: tuple[str, ...] = ("code", "name")
+
+
+def default_dim_fields(table_code: str) -> list[tuple]:
+    """某维表的默认字段配置行（通用列 + 该表专属列，按 sort_order 升序）。"""
+    rows = list(_DIM_FIELD_TEMPLATE) + list(_DIM_EXTRA_FIELDS.get(table_code, ()))
+    return sorted(rows, key=lambda r: r[7])
+
+
+def _seed_dim_fields_locked(conn: sqlite3.Connection, table_id: int | None = None) -> None:
+    """为尚无字段配置的维表按模板回填默认配置。幂等：已有任何一行配置就不再动，尊重用户改动。
+    调用方需持有 _lock（init_db 在同一把锁内调用）。"""
+    if table_id is None:
+        tables = conn.execute("SELECT id, code FROM dim_tables").fetchall()
+    else:
+        tables = conn.execute(
+            "SELECT id, code FROM dim_tables WHERE id = ?", (table_id,)
+        ).fetchall()
+    for t in tables:
+        has = conn.execute(
+            "SELECT id FROM dim_table_fields WHERE table_id = ? LIMIT 1", (t["id"],)
+        ).fetchone()
+        if has:
+            continue
+        for row in default_dim_fields(t["code"]):
+            conn.execute(
+                "INSERT OR IGNORE INTO dim_table_fields "
+                "(table_id, field_key, label_zh, label_en, field_type, required, max_len, no_cjk, sort_order, enabled) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (t["id"], *row),
+            )
+    conn.commit()
+
+
+def seed_dim_table_fields(table_id: int | None = None) -> None:
+    """为尚无字段配置的维表回填默认字段配置（幂等）。table_id 为空时处理全部维表。"""
+    with _lock:
+        _seed_dim_fields_locked(_connect(), table_id)
+
+
 def _seed_dim_tables(conn: sqlite3.Connection) -> None:
     """维表默认数据：model_provider（模型供应商）。已存在则跳过。"""
     row = conn.execute("SELECT id FROM dim_tables WHERE code = 'model_provider'").fetchone()
@@ -459,6 +545,7 @@ def init_db() -> None:
         _seed_settings(conn)
         _migrate_model_providers(conn)
         _seed_dim_tables(conn)
+        _seed_dim_fields_locked(conn)
         _refresh_provider_names(conn)
         _enforce_provider_api_key(conn)
         _ensure_default_model(conn)

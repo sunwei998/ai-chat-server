@@ -214,6 +214,24 @@ class DimTableUpdate(BaseModel):
     sort_order: int | None = None
 
 
+class DimFieldItem(BaseModel):
+    """单个维表字段的配置。field_key 必须是 dim_values 的物理列之一。"""
+
+    field_key: str = Field(min_length=1, max_length=32)
+    label_zh: str = Field(default="", max_length=32)
+    label_en: str = Field(default="", max_length=64)
+    field_type: str = Field(default="text", pattern=r"^(text|int|bool|secret)$")
+    required: bool = False
+    max_len: int = Field(default=0, ge=0, le=10000)
+    no_cjk: bool = False
+    sort_order: int = Field(default=0, ge=0, le=999999)
+    enabled: bool = True
+
+
+class DimFieldsPayload(BaseModel):
+    items: list[DimFieldItem]
+
+
 class DimValueCreate(BaseModel):
     code: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     name: str = Field(min_length=1, max_length=128)
