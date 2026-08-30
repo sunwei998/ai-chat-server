@@ -378,6 +378,7 @@ def _seed_settings(conn: sqlite3.Connection) -> None:
         ("websearch_max_pages", "3", "抓取正文的条数"),
         ("websearch_fetch_content", "true", "是否抓取网页正文"),
         ("websearch_max_content", "12000", "单条正文最大长度（字符）"),
+        ("import_file_retention_hours", "720", "导入源文件磁盘保留时长（小时，正整数；超期只删源文件、保留导入记录，720=30天）"),
     ]
     for key, value, remark in defaults:
         conn.execute(

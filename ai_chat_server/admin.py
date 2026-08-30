@@ -1386,6 +1386,9 @@ def update_setting(key: str, body: SettingsPayload, admin: dict = Depends(requir
     params: list = []
     log_msgs: list[tuple[str, str]] = []  # (中文, English)
     if body.value is not None:
+        bad_value = validate_setting_value(key, body.value)
+        if bad_value:
+            raise HTTPException(status_code=422, detail=bad_value)
         updates.append("value = ?")
         params.append(body.value)
         if old["value"] != body.value:
@@ -1587,6 +1590,12 @@ async def import_settings(file: UploadFile = File(...), admin: dict = Depends(re
             row_errors[n] = reason
             continue
         enabled = _parse_bool(cell(row, "enabled", "1"))
+
+        bad_value = validate_setting_value(key, value)
+        if bad_value:
+            errors.append(f"第 {n} 行：{bad_value}")
+            row_errors[n] = bad_value
+            continue
 
         exists = fetch_one("SELECT key FROM settings WHERE key = ?", (key,))
         if exists:
@@ -2367,6 +2376,82 @@ async def import_dim_values(
 
 _TRANSFER_DIR = os.path.join(os.path.dirname(settings.db_path) or ".", "transfers")
 
+# 导入源文件保留时长（小时）配置项，存于数据字典 settings；缺失/禁用/非法时回退默认值
+RETENTION_SETTING_KEY = "import_file_retention_hours"
+DEFAULT_IMPORT_RETENTION_HOURS = 720  # 30 天
+_POSITIVE_INT_RE = re.compile(r"^[1-9]\d*$")
+
+
+def get_import_retention_hours() -> int:
+    """读取导入源文件保留时长（小时）：仅接受 >0 的正整数，否则回退默认 720。"""
+    row = fetch_one("SELECT value, enabled FROM settings WHERE key = ?", (RETENTION_SETTING_KEY,))
+    if not row or not row["enabled"]:
+        return DEFAULT_IMPORT_RETENTION_HOURS
+    s = str(row["value"] or "").strip()
+    return int(s) if _POSITIVE_INT_RE.fullmatch(s) else DEFAULT_IMPORT_RETENTION_HOURS
+
+
+def validate_setting_value(key: str, value) -> str | None:
+    """特定 settings 键的值格式校验；合法返回 None，非法返回中文错误信息。"""
+    if key == RETENTION_SETTING_KEY:
+        s = str(value if value is not None else "").strip()
+        if not _POSITIVE_INT_RE.fullmatch(s):
+            return "导入源文件保留时长必须为大于 0 的正整数（单位：小时）"
+    return None
+
+# 过期导入源文件清理：只删磁盘文件、保留数据库记录（file_path 置空作为“已清理”标记）
+_LAST_PURGE_MONO = 0.0          # 上次懒清理的单调时钟（秒）
+_PURGE_INTERVAL_SEC = 6 * 3600  # 列表请求触发清理的最小间隔：6 小时
+
+
+def purge_expired_import_files() -> int:
+    """清理超过保留期的导入源文件以释放磁盘；记录保留，仅把 file_path 置空。
+
+    - 只处理 type='import'（导出本就不落盘，无需清理）
+    - 物理删除严格限制在 _TRANSFER_DIR 内，防路径穿越
+    - 即使磁盘文件已不存在，也把残留 file_path 置空（幂等，可重复执行）
+    返回被清理（置空 file_path）的记录条数。
+    """
+    retention_hours = get_import_retention_hours()
+    cutoff = now_ms() - retention_hours * 3600 * 1000
+    rows = fetch_all(
+        "SELECT id, file_path FROM transfer_records "
+        "WHERE type='import' AND created_at < ? AND file_path != ''",
+        (cutoff,),
+    )
+    if not rows:
+        return 0
+    base = os.path.abspath(_TRANSFER_DIR)
+    cleaned = 0
+    for r in rows:
+        full = os.path.abspath(r["file_path"] or "")
+        if full and (full == base or full.startswith(base + os.sep)):
+            try:
+                if os.path.isfile(full):
+                    os.remove(full)
+            except OSError:
+                pass
+        # 无论文件是否还在，都置空 file_path，标记源文件已按保留策略清理（幂等）
+        execute("UPDATE transfer_records SET file_path='' WHERE id=?", (r["id"],))
+        cleaned += 1
+    return cleaned
+
+
+def maybe_purge_expired_imports() -> None:
+    """列表请求触发的节流懒清理：距上次超过间隔才真正扫库，避免每次请求都清理。"""
+    global _LAST_PURGE_MONO
+    import time as _time
+
+    now_mono = _time.monotonic()
+    if now_mono - _LAST_PURGE_MONO < _PURGE_INTERVAL_SEC:
+        return
+    _LAST_PURGE_MONO = now_mono  # 先置位，避免并发请求重复清理
+    try:
+        purge_expired_import_files()
+    except Exception:
+        # 清理是旁路维护，任何异常都不能影响正常列表查询
+        pass
+
 
 @router.get("/transfers")
 def list_transfers(
@@ -2380,6 +2465,8 @@ def list_transfers(
 ):
     if type not in ("import", "export"):
         raise HTTPException(status_code=400, detail="type 仅支持 import/export")
+    # 旁路：打开记录列表时节流触发过期导入源文件清理（6h 一次，失败不影响查询）
+    maybe_purge_expired_imports()
     offset = (page - 1) * page_size
     clauses = ["type = ?"]
     params: list = [type]
@@ -2415,12 +2502,18 @@ def list_transfers(
         d = dict(r)
         d["has_file"] = bool(d.get("file_path")) and os.path.isfile(d["file_path"])
         items.append(d)
-    return {"items": items, "total": total, "page": page, "pageSize": page_size}
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+        "retention_hours": get_import_retention_hours(),
+    }
 
 
 @router.delete("/transfers/{record_id}")
-def delete_transfer(record_id: int):
-    """删除一条导入/导出记录；导入源文件一并清理（导出本就不存产物）。"""
+def delete_transfer(record_id: int, admin: dict = Depends(require_super_admin)):
+    """删除一条导入/导出记录（仅超级管理员）；导入源文件一并清理（导出本就不存产物）。"""
     row = fetch_one("SELECT * FROM transfer_records WHERE id = ?", (record_id,))
     if not row:
         raise HTTPException(status_code=404, detail="记录不存在")
