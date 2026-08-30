@@ -150,6 +150,22 @@ class SettingLogList(BaseModel):
     pageSize: int
 
 
+class OperationLogOut(BaseModel):
+    id: int
+    entity: str
+    entity_id: int
+    content: str
+    operator: str
+    created_at: int
+
+
+class OperationLogList(BaseModel):
+    items: list[OperationLogOut]
+    total: int
+    page: int
+    pageSize: int
+
+
 # ============ 通用维表（dim_tables / dim_values） ============
 
 

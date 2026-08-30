@@ -34,6 +34,7 @@ from .schemas import (
     DimValueOut,
     DimValueUpdate,
     ModelPayload,
+    OperationLogList,
     ResetPasswordRequest,
     SettingLogList,
     SettingsPayload,
@@ -292,6 +293,48 @@ def list_users(
     return {"items": [dict(r) for r in rows], "total": total, "page": page, "pageSize": page_size}
 
 
+# 用户可导出字段顺序（与 xlsx 表头一致）
+_USER_FIELDS = [
+    "username", "role", "is_active", "birthday", "gender", "province", "city", "district",
+    "logins", "total_tokens", "last_seen_at", "created_at", "updated_at", "updated_by",
+]
+
+
+# 注意：必须注册在 /users/{user_id} 之前，否则 "export" 会被 {user_id} 路由拦截（int 解析失败 → 422）
+@router.get("/users/export")
+def export_users(admin: dict = Depends(require_super_admin)):
+    """导出全部用户为 xlsx。导出不存产物：仅写行为记录。"""
+    username = admin.get("username") or "admin"
+    rows = fetch_all(
+        """
+        SELECT u.username, u.role, u.is_active, u.birthday, u.gender, u.province, u.city, u.district,
+               COALESCE((SELECT COUNT(*) FROM login_logs l WHERE l.user_id = u.id AND l.success = 1), 0) AS logins,
+               COALESCE((SELECT SUM(t.total_tokens) FROM token_usage t WHERE t.user_id = u.id), 0) AS total_tokens,
+               u.last_seen_at, u.created_at, u.updated_at, u.updated_by
+        FROM users u ORDER BY u.id
+        """
+    )
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "users"
+    ws.append(_USER_FIELDS)
+    for r in rows:
+        ws.append(["" if r[f] is None else r[f] for f in _USER_FIELDS])
+    buf = io.BytesIO()
+    wb.save(buf)
+    data = buf.getvalue()
+    filename = f"users_{now_ms()}.xlsx"
+    _write_transfer_meta(
+        "export", username, filename, len(data), _XLSX_MIME,
+        remark="用户数据导出", status="success",
+    )
+    return StreamingResponse(
+        iter([data]),
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/users/{user_id}")
 def get_user(user_id: int):
     row = fetch_one(
@@ -308,6 +351,56 @@ def get_user(user_id: int):
     if not row:
         raise HTTPException(status_code=404, detail="用户不存在")
     return dict(row)
+
+
+_ROLE_LABELS = {
+    "super_admin": ("超级管理员", "Super Admin"),
+    "system_admin": ("系统管理员", "System Admin"),
+    "model_admin": ("模型管理员", "Model Admin"),
+    "user": ("普通用户", "User"),
+    "subscriber": ("订阅用户", "Subscriber"),
+}
+
+_GENDER_LABELS = {
+    "male": ("男", "Male"),
+    "female": ("女", "Female"),
+    "other": ("其他", "Other"),
+}
+
+
+def _user_diff_logs(old: dict, body) -> list[tuple[str, str]]:
+    """用户字段级变更日志：逐字段比较旧值→新值，返回 (中文, English) 列表。"""
+    old = dict(old)  # 兼容 sqlite3.Row（fetch_one 返回）
+    msgs: list[tuple[str, str]] = []
+    if body.is_active is not None and bool(old["is_active"]) != bool(body.is_active):
+        o = "启用" if bool(old["is_active"]) else "禁用"
+        n = "启用" if body.is_active else "禁用"
+        oe = "enabled" if bool(old["is_active"]) else "disabled"
+        ne = "enabled" if body.is_active else "disabled"
+        msgs.append((f'状态从「{o}」改成「{n}」', f'Status changed from "{oe}" to "{ne}"'))
+    if body.role is not None and old["role"] != body.role:
+        o_zh, o_en = _ROLE_LABELS.get(old["role"], (old["role"], old["role"]))
+        n_zh, n_en = _ROLE_LABELS.get(body.role, (body.role, body.role))
+        msgs.append((f'角色从「{o_zh}」改成「{n_zh}」', f'Role changed from "{o_en}" to "{n_en}"'))
+    if body.gender is not None and (old.get("gender") or "") != body.gender:
+        o_zh, o_en = _GENDER_LABELS.get(old.get("gender") or "", ("未设置", "Not set"))
+        n_zh, n_en = _GENDER_LABELS.get(body.gender, (body.gender, body.gender))
+        msgs.append((f'性别从「{o_zh}」改成「{n_zh}」', f'Gender changed from "{o_en}" to "{n_en}"'))
+    if body.birthday is not None and (old.get("birthday") or "") != body.birthday:
+        old_b = old.get("birthday") or ""
+        new_b = body.birthday or ""
+        msgs.append((f'生日从「{old_b or "未设置"}」改成「{new_b or "未设置"}」',
+                     f'Birthday changed from "{old_b or "Not set"}" to "{new_b or "Not set"}"'))
+    if body.province is not None and (old.get("province") or "") != body.province:
+        msgs.append((f'省份从「{old.get("province") or ""}」改成「{body.province}」',
+                     f'Province changed from "{old.get("province") or ""}" to "{body.province}"'))
+    if body.city is not None and (old.get("city") or "") != body.city:
+        msgs.append((f'城市从「{old.get("city") or ""}」改成「{body.city}」',
+                     f'City changed from "{old.get("city") or ""}" to "{body.city}"'))
+    if body.district is not None and (old.get("district") or "") != body.district:
+        msgs.append((f'区县从「{old.get("district") or ""}」改成「{body.district}」',
+                     f'District changed from "{old.get("district") or ""}" to "{body.district}"'))
+    return msgs
 
 
 @router.patch("/users/{user_id}")
@@ -350,17 +443,45 @@ def update_user(user_id: int, body: UserUpdate, admin: dict = Depends(require_su
     params.append(admin["username"])
     params.append(user_id)
     execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", params)
+    # 字段级变更日志（旧值 → 新值）
+    for zh, en in _user_diff_logs(row, body):
+        _log_operation("user", user_id, admin, zh, en)
+    return {"ok": True}
+
+
+@router.delete("/users/{user_id}")
+def delete_user(user_id: int, admin: dict = Depends(require_super_admin)):
+    """删除用户：仅超级管理员可执行，且不能删除自己、只能删除未启用的用户。"""
+    if user_id == admin["id"]:
+        raise HTTPException(status_code=400, detail="不能删除自己")
+    row = fetch_one("SELECT * FROM users WHERE id = ?", (user_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if row["is_active"]:
+        raise HTTPException(status_code=400, detail="启用状态的用户不能删除，请先禁用")
+    # 清理关联数据（login_logs/token_usage 无外键，需手动删；sessions/messages 随 users 级联删除）
+    transaction([
+        ("DELETE FROM login_logs WHERE user_id = ?", (user_id,)),
+        ("DELETE FROM token_usage WHERE user_id = ?", (user_id,)),
+        ("DELETE FROM users WHERE id = ?", (user_id,)),
+    ])
+    _log_operation("user", user_id, admin, f"删除用户「{row['username']}」", f'Deleted user "{row["username"]}"')
     return {"ok": True}
 
 
 @router.post("/users/{user_id}/reset-password")
 def reset_password(user_id: int, body: ResetPasswordRequest, admin: dict = Depends(require_super_admin)):
-    row = fetch_one("SELECT id FROM users WHERE id = ?", (user_id,))
+    row = fetch_one("SELECT id, username FROM users WHERE id = ?", (user_id,))
     if not row:
         raise HTTPException(status_code=404, detail="用户不存在")
     execute(
         "UPDATE users SET password_hash = ?, updated_at = ?, updated_by = ? WHERE id = ?",
         (hash_password(body.password), now_ms(), admin["username"], user_id),
+    )
+    _log_operation(
+        "user", user_id, admin,
+        f"重置用户「{row['username']}」的密码",
+        f'Reset password for user "{row["username"]}"',
     )
     return {"ok": True}
 
@@ -570,6 +691,10 @@ def list_models(
     search: str = "",
     enabled: str = "",
     free: str = "",
+    vision: str = "",
+    supports_search: str = "",
+    name: str = "",
+    model_key: str = "",
     provider: str = "",
     sort: str = "",
     order: str = "asc",
@@ -580,12 +705,25 @@ def list_models(
     if search:
         clauses.append("(model_key LIKE ? OR name LIKE ? OR provider LIKE ?)")
         params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+    # 名称 / 模型标识独立模糊搜索（表头 input 筛选）
+    if name:
+        clauses.append("(name LIKE ? OR name_en LIKE ?)")
+        params.extend([f"%{name}%", f"%{name}%"])
+    if model_key:
+        clauses.append("model_key LIKE ?")
+        params.append(f"%{model_key}%")
     if enabled:
         clauses.append("enabled = ?")
         params.append(1 if enabled.strip().lower() == "true" else 0)
     if free:
         clauses.append("free = ?")
         params.append(1 if free.strip().lower() == "true" else 0)
+    if vision:
+        clauses.append("vision = ?")
+        params.append(1 if vision.strip().lower() == "true" else 0)
+    if supports_search:
+        clauses.append("supports_search = ?")
+        params.append(1 if supports_search.strip().lower() == "true" else 0)
     if provider:
         providers = [p.strip() for p in provider.split(",") if p.strip()]
         if providers:
@@ -1049,12 +1187,63 @@ def create_model(body: ModelPayload, admin: dict = Depends(require_model_admin))
             ("UPDATE models SET is_default = 0 WHERE id <> ?", (new_id,)),
             ("UPDATE models SET is_default = 1 WHERE id = ?", (new_id,)),
         ])
+    _log_operation(
+        "model", new_id, admin,
+        f"新增模型「{body.name}」（{body.model_key}）",
+        f'Created model "{body.name}" ({body.model_key})',
+    )
     return {"ok": True}
+
+
+def _model_diff_logs(old: dict, body) -> list[tuple[str, str]]:
+    """模型字段级变更日志：逐字段比较旧值→新值，返回 (中文, English) 列表。"""
+    old = dict(old)  # 兼容 sqlite3.Row（fetch_one 返回）
+    msgs: list[tuple[str, str]] = []
+
+    def yn(v) -> tuple[str, str]:
+        return ("是" if v else "否", "Yes" if v else "No")
+
+    def en_txt(v) -> tuple[str, str]:
+        return ("启用" if v else "禁用", "enabled" if v else "disabled")
+
+    if old["model_key"] != body.model_key:
+        msgs.append((f'模型标识从「{old["model_key"]}」改成「{body.model_key}」',
+                     f'Model key changed from "{old["model_key"]}" to "{body.model_key}"'))
+    if old["name"] != body.name:
+        msgs.append((f'名称从「{old["name"]}」改成「{body.name}」',
+                     f'Name changed from "{old["name"]}" to "{body.name}"'))
+    old_name_en = old.get("name_en") or ""
+    new_name_en = body.name_en or ""
+    if old_name_en != new_name_en:
+        msgs.append((f'英文名称从「{old_name_en}」改成「{new_name_en}」',
+                     f'English name changed from "{old_name_en}" to "{new_name_en}"'))
+    if old["provider"] != body.provider:
+        msgs.append((f'提供商从「{old["provider"]}」改成「{body.provider}」',
+                     f'Provider changed from "{old["provider"]}" to "{body.provider}"'))
+    if bool(old["free"]) != bool(body.free):
+        o, oe = yn(bool(old["free"])); n, ne = yn(body.free)
+        msgs.append((f'免费从「{o}」改成「{n}」', f'Free changed from "{oe}" to "{ne}"'))
+    if bool(old["vision"]) != bool(body.vision):
+        o, oe = yn(bool(old["vision"])); n, ne = yn(body.vision)
+        msgs.append((f'视觉从「{o}」改成「{n}」', f'Vision changed from "{oe}" to "{ne}"'))
+    if bool(old["supports_search"]) != bool(body.supports_search):
+        o, oe = yn(bool(old["supports_search"])); n, ne = yn(body.supports_search)
+        msgs.append((f'联网从「{o}」改成「{n}」', f'Web search changed from "{oe}" to "{ne}"'))
+    if bool(old["enabled"]) != bool(body.enabled):
+        o, oe = en_txt(bool(old["enabled"])); n, ne = en_txt(body.enabled)
+        msgs.append((f'状态从「{o}」改成「{n}」', f'Status changed from "{oe}" to "{ne}"'))
+    if int(old["sort_order"]) != int(body.sort_order):
+        msgs.append((f'排序从「{old["sort_order"]}」改成「{body.sort_order}」',
+                     f'Sort order changed from "{old["sort_order"]}" to "{body.sort_order}"'))
+    if bool(old["is_default"]) != bool(body.is_default):
+        o, oe = yn(bool(old["is_default"])); n, ne = yn(body.is_default)
+        msgs.append((f'默认从「{o}」改成「{n}」', f'Default changed from "{oe}" to "{ne}"'))
+    return msgs
 
 
 @router.put("/models/{model_id}")
 def update_model(model_id: int, body: ModelPayload, admin: dict = Depends(require_model_admin)):
-    row = fetch_one("SELECT id, enabled, is_default FROM models WHERE id = ?", (model_id,))
+    row = fetch_one("SELECT * FROM models WHERE id = ?", (model_id,))
     if not row:
         raise HTTPException(status_code=404, detail="模型不存在")
 
@@ -1075,6 +1264,9 @@ def update_model(model_id: int, body: ModelPayload, admin: dict = Depends(requir
             raise HTTPException(status_code=409, detail="英文名称已存在")
 
     effective_enabled = body.enabled if body.enabled is not None else bool(row["enabled"])
+
+    # 字段级变更日志（旧值 → 新值）
+    log_msgs = _model_diff_logs(row, body)
 
     if not body.is_default:
         # 未请求设为默认：保护与默认相关的约束
@@ -1098,6 +1290,8 @@ def update_model(model_id: int, body: ModelPayload, admin: dict = Depends(requir
                 model_id,
             ),
         )
+        for zh, en in log_msgs:
+            _log_operation("model", model_id, admin, zh, en)
         return {"ok": True}
 
     # 请求设为默认：禁用模型不允许
@@ -1123,12 +1317,22 @@ def update_model(model_id: int, body: ModelPayload, admin: dict = Depends(requir
             params,
         ),
     ])
+    for zh, en in log_msgs:
+        _log_operation("model", model_id, admin, zh, en)
     return {"ok": True}
 
 
 @router.delete("/models/{model_id}")
 def delete_model(model_id: int, admin: dict = Depends(require_model_admin)):
+    row = fetch_one("SELECT id, name, model_key FROM models WHERE id = ?", (model_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="模型不存在")
     execute("DELETE FROM models WHERE id = ?", (model_id,))
+    _log_operation(
+        "model", model_id, admin,
+        f"删除模型「{row['name']}」（{row['model_key']}）",
+        f'Deleted model "{row["name"]}" ({row["model_key"]})',
+    )
     return {"ok": True}
 
 
@@ -1234,6 +1438,196 @@ def delete_setting(key: str, admin: dict = Depends(require_settings_admin)):
     return {"ok": True}
 
 
+# 配置项可导入导出的字段顺序（与 xlsx 表头一致）
+_SETTING_FIELDS = ["key", "value", "remark", "enabled"]
+
+
+def _setting_rows() -> list[list]:
+    rows = fetch_all("SELECT * FROM settings ORDER BY key")
+    return [
+        [r["key"], "" if r["value"] is None else r["value"], "" if r["remark"] is None else r["remark"], 1 if r["enabled"] else 0]
+        for r in rows
+    ]
+
+
+@router.get("/settings/export")
+def export_settings(admin: dict = Depends(require_settings_admin)):
+    """导出全部配置项为 xlsx。导出不存产物：仅写行为记录。"""
+    username = admin.get("username") or "admin"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "settings"
+    ws.append(_SETTING_FIELDS)
+    for row in _setting_rows():
+        ws.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    data = buf.getvalue()
+    filename = f"settings_{now_ms()}.xlsx"
+    _write_transfer_meta(
+        "export", username, filename, len(data), _XLSX_MIME,
+        remark="配置数据导出", status="success",
+    )
+    return StreamingResponse(
+        iter([data]),
+        media_type=_XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/settings/template")
+def download_settings_template(request: Request, admin: dict = Depends(require_settings_admin)):
+    """下载配置项导入模板：英文字段表头 + 本地化示例行 + enabled 布尔下拉。"""
+    is_en = "en" in (request.headers.get("accept-language") or "").lower()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "settings"
+    ws.append(_SETTING_FIELDS)
+    ws.append(["example_key", "example value", "example remark", "yes"] if is_en
+               else ["example_key", "示例值", "示例说明", "是"])
+    dv = DataValidation(
+        type="list",
+        formula1='"yes,no"' if is_en else '"是,否"',
+        allow_blank=True,
+        showDropDown=False,
+    )
+    dv.error = 'Please choose "yes" or "no"' if is_en else "请选择「是」或「否」"
+    dv.errorTitle = "Invalid value" if is_en else "非法值"
+    ws.add_data_validation(dv)
+    dv.add("D2:D1000")
+    return _dim_xlsx_response(wb, "settings_template.xlsx")
+
+
+@router.post("/settings/import")
+async def import_settings(file: UploadFile = File(...), admin: dict = Depends(require_settings_admin)):
+    """从 xlsx 批量导入配置项：key 已存在则更新，否则新增。"""
+    raw = await file.read()
+    original_name = file.filename or "settings_import.xlsx"
+    username = admin.get("username") or "admin"
+    if len(raw) > 10 * 1024 * 1024:
+        _write_transfer_meta(
+            "import", username, original_name, len(raw), _XLSX_MIME,
+            remark="配置数据导入：文件过大（上限 10MB）", status="failed",
+        )
+        raise HTTPException(status_code=400, detail="文件过大（上限 10MB）")
+
+    saved_path, record_id = _write_transfer_record(
+        "import", username, original_name, raw, _XLSX_MIME,
+        remark="配置数据导入", status="",
+    )
+
+    def _mark_failed(reason: str) -> None:
+        execute(
+            "UPDATE transfer_records SET status='failed', remark=? WHERE id=?",
+            (f"配置数据导入：{reason}", record_id),
+        )
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
+    except Exception:
+        _mark_failed("无法解析文件")
+        raise HTTPException(status_code=400, detail="无法解析文件，请上传有效的 .xlsx 文件")
+
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        header_row = next(rows_iter)
+    except StopIteration:
+        _mark_failed("空文件")
+        raise HTTPException(status_code=400, detail="空文件")
+
+    header = [str(h).strip().lower() if h is not None else "" for h in header_row]
+    if "key" not in header:
+        _mark_failed("缺少 key 列")
+        raise HTTPException(status_code=400, detail="xlsx 缺少 key 列")
+
+    idx = {h: i for i, h in enumerate(header)}
+
+    def cell(row, key: str, default=""):
+        i = idx.get(key)
+        if i is None or i >= len(row) or row[i] is None:
+            return default
+        return row[i]
+
+    created = 0
+    updated = 0
+    errors: list[str] = []
+    row_errors: dict[int, str] = {}
+    seen_keys: set[str] = set()
+
+    for n, row in enumerate(rows_iter, start=2):
+        if row is None or not any(c is not None and str(c).strip() for c in row):
+            continue
+        key = str(cell(row, "key", "")).strip()
+        if not key:
+            reason = "key 不能为空"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+        if not (1 <= len(key) < 64) or not _SETTING_KEY_RE.match(key):
+            reason = "key 格式非法（仅英文字母/下划线，长度 1-63）"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+        if key in seen_keys:
+            reason = f"文件内键名重复：{key}"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+        value = str(cell(row, "value", "") or "")
+        remark = str(cell(row, "remark", "") or "")
+        if len(value) >= 5000:
+            reason = "value 长度超限（5000）"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+        if len(remark) > 255:
+            reason = "remark 长度超限（255）"
+            errors.append(f"第 {n} 行：{reason}")
+            row_errors[n] = reason
+            continue
+        enabled = _parse_bool(cell(row, "enabled", "1"))
+
+        exists = fetch_one("SELECT key FROM settings WHERE key = ?", (key,))
+        if exists:
+            execute(
+                "UPDATE settings SET value = ?, remark = ?, enabled = ? WHERE key = ?",
+                (value, remark, enabled, key),
+            )
+            _log_setting(key, admin, f"导入更新配置项「{key}」", f'Imported update to setting "{key}"')
+            updated += 1
+        else:
+            execute(
+                "INSERT INTO settings (key, value, remark, enabled) VALUES (?, ?, ?, ?)",
+                (key, value, remark, enabled),
+            )
+            _log_setting(key, admin, f"导入新增配置项「{key}」", f'Imported new setting "{key}"')
+            created += 1
+        seen_keys.add(key)
+
+    if row_errors and (created + updated) == 0:
+        status = "failed"
+    elif row_errors:
+        status = "partial"
+    else:
+        status = "success"
+
+    if row_errors:
+        try:
+            ann_path, ann_size = _build_annotated_file(raw, row_errors, original_name)
+            if os.path.isfile(saved_path):
+                os.remove(saved_path)
+            execute(
+                "UPDATE transfer_records SET file_path=?, file_size=? WHERE id=?",
+                (ann_path, ann_size, record_id),
+            )
+        except Exception:
+            pass
+
+    execute("UPDATE transfer_records SET status=? WHERE id=?", (status, record_id))
+    return {"ok": True, "created": created, "updated": updated, "errors": errors}
+
+
 @router.get("/settings/{key}/logs", response_model=SettingLogList)
 def list_setting_logs(
     key: str,
@@ -1250,6 +1644,36 @@ def list_setting_logs(
     rows = fetch_all(
         "SELECT * FROM setting_logs WHERE setting_key = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         (key, page_size, offset),
+    )
+    items = []
+    for r in rows:
+        d = dict(r)
+        if is_en:
+            d["content"] = d.get("content_en") or d["content"]
+        items.append(d)
+    return {"items": items, "total": total, "page": page, "pageSize": page_size}
+
+
+@router.get("/operation-logs", response_model=OperationLogList)
+def list_operation_logs(
+    entity: str,
+    entity_id: int,
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+):
+    """通用操作日志：按实体类型 + 实体 id 分页查询（模型/维表取值/用户共用）。
+    content 按 Accept-Language 返回中文或英文。"""
+    offset = (page - 1) * page_size
+    is_en = "en" in (request.headers.get("accept-language") or "").lower()
+    total = fetch_one(
+        "SELECT COUNT(*) AS n FROM admin_operation_logs WHERE entity = ? AND entity_id = ?",
+        (entity, entity_id),
+    )["n"]
+    rows = fetch_all(
+        "SELECT * FROM admin_operation_logs WHERE entity = ? AND entity_id = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        (entity, entity_id, page_size, offset),
     )
     items = []
     for r in rows:
@@ -1278,6 +1702,15 @@ def _log_setting(key: str, admin: dict, content: str, content_en: str = "") -> N
     execute(
         "INSERT INTO setting_logs (setting_key, content, content_en, operator, created_at) VALUES (?, ?, ?, ?, ?)",
         (key, content, content_en, admin.get("username") or "", now_ms()),
+    )
+
+
+def _log_operation(entity: str, entity_id: int, admin: dict, content: str, content_en: str = "") -> None:
+    """写入通用操作日志（模型 / 维表取值 / 用户共用）。"""
+    execute(
+        "INSERT INTO admin_operation_logs (entity, entity_id, content, content_en, operator, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (entity, entity_id, content, content_en, admin.get("username") or "", now_ms()),
     )
 
 
@@ -1488,7 +1921,7 @@ def create_dim_value(
     if dup:
         raise HTTPException(status_code=400, detail="该编码在当前维表已存在")
     ts = now_ms()
-    execute(
+    value_id = execute(
         "INSERT INTO dim_values (table_id, code, name, name_en, api_key, sort_order, enabled, remark, created_at, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
@@ -1504,7 +1937,47 @@ def create_dim_value(
             ts,
         ),
     )
+    _log_operation(
+        "dim_value", value_id, admin,
+        f"新增取值「{body.name}」（{body.code}）",
+        f'Created value "{body.name}" ({body.code})',
+    )
     return {"ok": True}
+
+
+def _dim_value_diff_logs(old: dict, body) -> list[tuple[str, str]]:
+    """维表取值字段级变更日志：逐字段比较旧值→新值，返回 (中文, English) 列表。"""
+    old = dict(old)  # 兼容 sqlite3.Row（fetch_one 返回）
+    msgs: list[tuple[str, str]] = []
+    if body.code is not None and old["code"] != body.code:
+        msgs.append((f'编码从「{old["code"]}」改成「{body.code}」',
+                     f'Code changed from "{old["code"]}" to "{body.code}"'))
+    if body.name is not None and old["name"] != body.name:
+        msgs.append((f'名称从「{old["name"]}」改成「{body.name}」',
+                     f'Name changed from "{old["name"]}" to "{body.name}"'))
+    if body.name_en is not None:
+        new_ne = body.name_en.strip()
+        if (old.get("name_en") or "") != new_ne:
+            msgs.append((f'英文名称从「{old.get("name_en") or ""}」改成「{new_ne}」',
+                         f'English name changed from "{old.get("name_en") or ""}" to "{new_ne}"'))
+    if body.api_key is not None and not _is_masked_secret(body.api_key):
+        new_key = body.api_key.strip()
+        if (old.get("api_key") or "") != new_key:
+            # 密钥敏感，日志不记录具体值
+            msgs.append(("API密钥已更新", "API key updated"))
+    if body.sort_order is not None and int(old.get("sort_order") or 0) != int(body.sort_order):
+        msgs.append((f'排序从「{old.get("sort_order")}」改成「{body.sort_order}」',
+                     f'Sort order changed from "{old.get("sort_order")}" to "{body.sort_order}"'))
+    if body.enabled is not None and bool(old["enabled"]) != bool(body.enabled):
+        o = "启用" if bool(old["enabled"]) else "禁用"
+        n = "启用" if body.enabled else "禁用"
+        oe = "enabled" if bool(old["enabled"]) else "disabled"
+        ne = "enabled" if body.enabled else "disabled"
+        msgs.append((f'状态从「{o}」改成「{n}」', f'Status changed from "{oe}" to "{ne}"'))
+    if body.remark is not None and (old.get("remark") or "") != body.remark:
+        msgs.append((f'备注从「{old.get("remark") or ""}」改成「{body.remark}」',
+                     f'Remark changed from "{old.get("remark") or ""}" to "{body.remark}"'))
+    return msgs
 
 
 @router.put("/dim-tables/{table_id}/values/{value_id}")
@@ -1515,7 +1988,7 @@ def update_dim_value(
     admin: dict = Depends(require_settings_admin),
 ):
     row = fetch_one(
-        "SELECT id, code, api_key, enabled FROM dim_values WHERE id = ? AND table_id = ?",
+        "SELECT * FROM dim_values WHERE id = ? AND table_id = ?",
         (value_id, table_id),
     )
     if not row:
@@ -1568,6 +2041,9 @@ def update_dim_value(
         params.append(now_ms())
         params.append(value_id)
         execute(f"UPDATE dim_values SET {', '.join(updates)} WHERE id = ?", params)
+        # 字段级变更日志（旧值 → 新值）
+        for zh, en in _dim_value_diff_logs(row, body):
+            _log_operation("dim_value", value_id, admin, zh, en)
     return {"ok": True}
 
 
@@ -1576,11 +2052,16 @@ def delete_dim_value(
     table_id: int, value_id: int, admin: dict = Depends(require_settings_admin)
 ):
     row = fetch_one(
-        "SELECT id FROM dim_values WHERE id = ? AND table_id = ?", (value_id, table_id)
+        "SELECT id, name FROM dim_values WHERE id = ? AND table_id = ?", (value_id, table_id)
     )
     if not row:
         raise HTTPException(status_code=404, detail="维表取值不存在")
     execute("DELETE FROM dim_values WHERE id = ?", (value_id,))
+    _log_operation(
+        "dim_value", value_id, admin,
+        f"删除取值「{row['name']}」",
+        f'Deleted value "{row["name"]}"',
+    )
     return {"ok": True}
 
 
@@ -1892,6 +2373,8 @@ def list_transfers(
     type: str = Query("import", description="import / export"),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    status: str = "",
+    username: str = "",
     sort: str = "",
     order: str = "desc",
 ):
@@ -1900,6 +2383,16 @@ def list_transfers(
     offset = (page - 1) * page_size
     clauses = ["type = ?"]
     params: list = [type]
+    if status:
+        statuses = [s.strip() for s in status.split(",") if s.strip()]
+        if statuses:
+            clauses.append("status IN (" + ",".join("?" for _ in statuses) + ")")
+            params.extend(statuses)
+    if username:
+        usernames = [u.strip() for u in username.split(",") if u.strip()]
+        if usernames:
+            clauses.append("username IN (" + ",".join("?" for _ in usernames) + ")")
+            params.extend(usernames)
     where = "WHERE " + " AND ".join(clauses)
     sort_columns = {
         "id": "id",
@@ -1923,6 +2416,36 @@ def list_transfers(
         d["has_file"] = bool(d.get("file_path")) and os.path.isfile(d["file_path"])
         items.append(d)
     return {"items": items, "total": total, "page": page, "pageSize": page_size}
+
+
+@router.delete("/transfers/{record_id}")
+def delete_transfer(record_id: int):
+    """删除一条导入/导出记录；导入源文件一并清理（导出本就不存产物）。"""
+    row = fetch_one("SELECT * FROM transfer_records WHERE id = ?", (record_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    file_path = row["file_path"]
+    if file_path:
+        base = os.path.abspath(_TRANSFER_DIR)
+        full = os.path.abspath(file_path)
+        if full == base or full.startswith(base + os.sep):
+            try:
+                if os.path.isfile(full):
+                    os.remove(full)
+            except OSError:
+                pass
+    execute("DELETE FROM transfer_records WHERE id = ?", (record_id,))
+    return {"ok": True}
+
+
+@router.get("/admins")
+def list_admins():
+    """返回所有管理员用户名（供导入/导出记录的操作人筛选下拉框）。"""
+    rows = fetch_all(
+        "SELECT DISTINCT username FROM users "
+        "WHERE role IN ('super_admin','system_admin','model_admin') ORDER BY username"
+    )
+    return [r["username"] for r in rows]
 
 
 @router.get("/transfers/{record_id}/download")

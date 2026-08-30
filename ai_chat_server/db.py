@@ -84,6 +84,18 @@ CREATE TABLE IF NOT EXISTS setting_logs (
 
 CREATE INDEX IF NOT EXISTS idx_setting_logs_key ON setting_logs (setting_key, created_at);
 
+CREATE TABLE IF NOT EXISTS admin_operation_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity TEXT NOT NULL,
+  entity_id INTEGER NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  content_en TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_op_logs_entity ON admin_operation_logs (entity, entity_id, created_at);
+
 CREATE TABLE IF NOT EXISTS dim_tables (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   code TEXT UNIQUE NOT NULL,
